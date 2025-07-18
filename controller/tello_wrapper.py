@@ -2,10 +2,12 @@ import time, cv2
 import numpy as np
 from typing import Tuple
 from djitellopy import Tello
+from threading import Event
 
 from .abs.robot_wrapper import RobotWrapper
 
 import logging
+
 Tello.LOGGER.setLevel(logging.WARNING)
 
 MOVEMENT_MIN = 20
@@ -14,10 +16,11 @@ MOVEMENT_MAX = 300
 SCENE_CHANGE_DISTANCE = 120
 SCENE_CHANGE_ANGLE = 90
 
+
 def adjust_exposure(img, alpha=1.0, beta=0):
     """
     Adjust the exposure of an image.
-    
+
     :param img: Input image
     :param alpha: Contrast control (1.0-3.0). Higher values increase exposure.
     :param beta: Brightness control (0-100). Higher values add brightness.
@@ -27,10 +30,11 @@ def adjust_exposure(img, alpha=1.0, beta=0):
     new_img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
     return new_img
 
+
 def sharpen_image(img):
     """
     Apply a sharpening filter to an image.
-    
+
     :param img: Input image
     :return: Sharpened image
     """
@@ -38,10 +42,11 @@ def sharpen_image(img):
     kernel = np.array([[0, -1, 0],
                        [-1, 5, -1],
                        [0, -1, 0]])
-    
+
     # Apply the sharpening filter
     sharpened = cv2.filter2D(img, -1, kernel)
     return sharpened
+
 
 class FrameReader:
     def __init__(self, fr):
@@ -54,7 +59,8 @@ class FrameReader:
         frame = self.fr.frame
         frame = adjust_exposure(frame, alpha=1.3, beta=-30)
         return sharpen_image(frame)
-        
+
+
 def cap_distance(distance):
     if distance < MOVEMENT_MIN:
         return MOVEMENT_MIN
@@ -62,11 +68,36 @@ def cap_distance(distance):
         return MOVEMENT_MAX
     return distance
 
+
 class TelloWrapper(RobotWrapper):
     def __init__(self):
         self.drone = Tello()
         self.active_count = 0
         self.stream_on = False
+
+        # ADD CANCELLATION SUPPORT
+        self.cancellation_event = Event()
+        self.movement_x_accumulator = 0
+        self.movement_y_accumulator = 0
+        self.rotation_accumulator = 0
+
+    def set_cancellation_event(self, event: Event):
+        """Set the cancellation event from the controller"""
+        self.cancellation_event = event
+
+    def stop_all_commands(self):
+        """Only signal cancellation - no drone commands"""
+        self.cancellation_event.set()
+        # No drone commands - let current movement finish, prevent new ones
+
+    def _sleep_with_cancellation(self, duration: float):
+        """Sleep while checking for cancellation every 0.1 seconds"""
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            if self.cancellation_event.is_set():
+                return False
+            time.sleep(0.1)
+        return True
 
     def keep_active(self):
         if self.active_count % 20 == 0:
@@ -100,53 +131,99 @@ class TelloWrapper(RobotWrapper):
         return FrameReader(self.drone.get_frame_read())
 
     def move_forward(self, distance: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.move_forward(cap_distance(distance))
         self.movement_x_accumulator += distance
-        time.sleep(0.5)
+
+        if not self._sleep_with_cancellation(0.5):
+            return False, False
+
         return True, distance > SCENE_CHANGE_DISTANCE
 
     def move_backward(self, distance: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.move_back(cap_distance(distance))
         self.movement_x_accumulator -= distance
-        time.sleep(0.5)
+
+        if not self._sleep_with_cancellation(0.5):
+            return False, False
+
         return True, distance > SCENE_CHANGE_DISTANCE
 
     def move_left(self, distance: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.move_left(cap_distance(distance))
         self.movement_y_accumulator += distance
-        time.sleep(0.5)
+
+        if not self._sleep_with_cancellation(0.5):
+            return False, False
+
         return True, distance > SCENE_CHANGE_DISTANCE
 
     def move_right(self, distance: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.move_right(cap_distance(distance))
         self.movement_y_accumulator -= distance
-        time.sleep(0.5)
+
+        if not self._sleep_with_cancellation(0.5):
+            return False, False
+
         return True, distance > SCENE_CHANGE_DISTANCE
 
     def move_up(self, distance: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.move_up(cap_distance(distance))
-        time.sleep(0.5)
+
+        if not self._sleep_with_cancellation(0.5):
+            return False, False
+
         return True, False
 
     def move_down(self, distance: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.move_down(cap_distance(distance))
-        time.sleep(0.5)
+
+        if not self._sleep_with_cancellation(0.5):
+            return False, False
+
         return True, False
 
     def turn_ccw(self, degree: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.rotate_counter_clockwise(degree)
         self.rotation_accumulator += degree
-        time.sleep(1)
-        # return True, degree > SCENE_CHANGE_ANGLE
+
+        if not self._sleep_with_cancellation(1.0):
+            return False, False
+
         return True, False
 
     def turn_cw(self, degree: int) -> Tuple[bool, bool]:
+        if self.cancellation_event.is_set():
+            return False, False
+
         self.drone.rotate_clockwise(degree)
         self.rotation_accumulator -= degree
-        time.sleep(1)
-        # return True, degree > SCENE_CHANGE_ANGLE
+
+        if not self._sleep_with_cancellation(1.0):
+            return False, False
+
         return True, False
-    
+
     def is_battery_good(self) -> bool:
         self.battery = self.drone.query_battery()
         print(f"> Battery level: {self.battery}% ", end='')
