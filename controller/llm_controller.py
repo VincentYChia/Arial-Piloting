@@ -5,6 +5,7 @@ import asyncio
 import uuid
 from enum import Enum
 import re
+from threading import Event
 
 from .shared_frame import SharedFrame, Frame
 from .yolo_client import YoloClient
@@ -36,6 +37,11 @@ class LLMController():
         self.controller_active = True
         self.controller_wait_takeoff = True
         self.message_queue = message_queue
+
+        # ADD CANCELLATION SUPPORT
+        self.cancellation_event = Event()
+        self.current_interpreter = None
+
         if message_queue is None:
             self.cache_folder = os.path.join(CURRENT_DIR, 'cache')
         else:
@@ -132,6 +138,10 @@ class LLMController():
 
         Statement.low_level_skillset = self.low_level_skillset
         Statement.high_level_skillset = self.high_level_skillset
+
+        # CRITICAL: Connect cancellation event to robot wrapper
+        self.drone.set_cancellation_event(self.cancellation_event)
+
         self.planner.init(high_level_skillset=self.high_level_skillset, low_level_skillset=self.low_level_skillset,
                           vision_skill=self.vision)
 
@@ -152,12 +162,18 @@ class LLMController():
         print_t(f"[C] Setting MiniSpec model to: {model_name}")
         self.planner.set_minispec_model(model_name, temperature)
 
-    # ========== SKILL METHODS ==========
+    # ========== SKILL METHODS WITH CANCELLATION SUPPORT ==========
     def skill_time(self) -> Tuple[float, bool]:
         return time.time() - self.execution_time, False
 
     def skill_goto(self, object_name: str) -> Tuple[None, bool]:
         print_t(f'[C] Executing goto: {object_name}')
+
+        # Check for cancellation before executing
+        if self.cancellation_event.is_set():
+            print_t("[C] GOTO cancelled before execution")
+            return None, False
+
         if '[' in object_name:
             x = float(object_name.split('[')[1].split(']')[0])
         else:
@@ -168,17 +184,25 @@ class LLMController():
         if x > 0.55:
             turn_amount = int((x - 0.5) * 70)
             print_t(f'[C] Turning clockwise {turn_amount} degrees')
-            self.drone.turn_cw(turn_amount)
+            if not self.cancellation_event.is_set():
+                self.drone.turn_cw(turn_amount)
         elif x < 0.45:
             turn_amount = int((0.5 - x) * 70)
             print_t(f'[C] Turning counter-clockwise {turn_amount} degrees')
-            self.drone.turn_ccw(turn_amount)
+            if not self.cancellation_event.is_set():
+                self.drone.turn_ccw(turn_amount)
 
         print_t('[C] Moving forward 110 units')
-        self.drone.move_forward(110)
+        if not self.cancellation_event.is_set():
+            self.drone.move_forward(110)
         return None, False
 
     def skill_take_picture(self) -> Tuple[None, bool]:
+        # Check for cancellation before executing
+        if self.cancellation_event.is_set():
+            print_t("[C] Take picture cancelled")
+            return None, False
+
         img_path = os.path.join(self.cache_folder, f"{uuid.uuid4()}.jpg")
         Image.fromarray(self.latest_frame).save(img_path)
         print_t(f"[C] Picture saved to: {img_path}")
@@ -197,7 +221,14 @@ class LLMController():
 
     def skill_delay(self, s: float) -> Tuple[None, bool]:
         print_t(f"[C] Delaying for {s} seconds")
-        time.sleep(s)
+
+        # Check for cancellation during delay
+        start_time = time.time()
+        while time.time() - start_time < s:
+            if self.cancellation_event.is_set():
+                print_t("[C] Delay cancelled")
+                return None, False
+            time.sleep(0.1)
         return None, False
 
     # ========== MESSAGING AND CONTROL ==========
@@ -209,6 +240,19 @@ class LLMController():
         print_t("[C] Stopping controller...")
         self.controller_active = False
 
+        # Signal cancellation to current interpreter
+        self.cancellation_event.set()
+
+        # Cancel current interpreter if it exists
+        if self.current_interpreter is not None:
+            print_t("[C] Cancelling current interpreter...")
+            self.current_interpreter.cancel()
+
+        # If drone has a stop method, call it
+        if hasattr(self.drone, 'stop_all_commands'):
+            print_t("[C] Stopping all drone commands...")
+            self.drone.stop_all_commands()
+
     def get_latest_frame(self, plot=False):
         image = self.shared_frame.get_image()
         if plot and image:
@@ -218,11 +262,21 @@ class LLMController():
 
     def execute_minispec(self, minispec: str):
         print_t(f"[C] Executing MiniSpec: {minispec}")
-        interpreter = MiniSpecInterpreter(self.message_queue)
+
+        # Create interpreter with separate message queue to avoid duplication
+        # We'll use None to prevent the interpreter from sending code chunks
+        interpreter = MiniSpecInterpreter(message_queue=None)
+        self.current_interpreter = interpreter
+
+        # Clear cancellation event for new execution
+        self.cancellation_event.clear()
+
         interpreter.execute(minispec)
         self.execution_history = interpreter.execution_history
         ret_val = interpreter.ret_queue.get()
         print_t(f"[C] MiniSpec execution result: {ret_val}")
+
+        self.current_interpreter = None
         return ret_val
 
     def execute_task_description(self, task_description: str):
@@ -278,12 +332,13 @@ class LLMController():
                 print_t(f"[C] Generated code: {minispec_code}")
                 print_t(f"[C] Code length: {len(minispec_code)} characters")
 
-                # Send messages to UI/queue
+                # Send messages to UI/queue - FIXED: Only send once here
                 if plan_reason:
                     self.append_message(f'[Plan]: {plan_reason}')
                 else:
                     self.append_message(f'[Plan]: No reasoning provided')
 
+                # FIXED: Only send the code once, not during interpreter parsing
                 self.append_message(f'[Code]: {minispec_code}')
 
                 # Validate the generated code before execution
@@ -350,6 +405,7 @@ class LLMController():
         # Cleanup
         self.current_plan = None
         self.execution_history = None
+        self.current_interpreter = None
 
     # ========== ROBOT CONTROL ==========
     def start_robot(self):
