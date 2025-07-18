@@ -150,8 +150,8 @@ class LLMPlanner():
 
         # MODEL CONFIGURATION (EASILY MODIFIABLE)
         # Both models use local Ollama for now
-        self.reasoning_model = "robot-pilot-reason9"
-        self.minispec_model = "robot-pilot-writer17"
+        self.reasoning_model = "robot-pilot-reason11"
+        self.minispec_model = "robot-pilot-writer23"
 
         # Temperature settings for each model
         self.reasoning_temperature = 0.5  # Slightly higher for reasoning creativity

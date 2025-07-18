@@ -33,10 +33,11 @@ class TypeFly:
         self.asyncio_loop = asyncio.get_event_loop()
         self.use_llama3 = False
 
-        # ========== CONCURRENT EXECUTION PROTECTION ==========
-        self.task_lock = Lock()  # Prevents concurrent task execution
+        # ENHANCED CONCURRENT EXECUTION PROTECTION
+        self.task_lock = Lock()
         self.current_task_thread = None
         self.task_cancelled = False
+        self.task_in_progress = False
 
         default_sentences = [
             "Find something I can eat.",
@@ -48,10 +49,8 @@ class TypeFly:
         with self.ui:
             gr.HTML(open(os.path.join(CURRENT_DIR, 'header.html'), 'r').read())
             gr.HTML(open(os.path.join(CURRENT_DIR, 'drone-pov.html'), 'r').read())
-            gr.ChatInterface(self.process_message, retry_btn=None, fill_height=False,
+            gr.ChatInterface(self.process_message, fill_height=False,
                              examples=default_sentences).queue()
-            # Fixed checkbox for dual-model architecture
-            # gr.Checkbox(label='Use llama3', value=False).select(self.checkbox_llama3)
 
     def checkbox_llama3(self):
         """Fixed for dual-model architecture"""
@@ -66,34 +65,63 @@ class TypeFly:
             self.llm_controller.set_minispec_model(TINY_LLAMA)
 
     def cancel_current_task(self):
-        """Cancel the currently running task"""
-        print_t("[S] Cancelling current task...")
+        """Enhanced cancellation method"""
+        print_t("[S] ========== CANCELLATION INITIATED ==========")
         self.task_cancelled = True
+
+        # Stop the controller (this will set the cancellation event)
         self.llm_controller.stop_controller()
 
         # Wait for current task to finish with timeout
         if self.current_task_thread and self.current_task_thread.is_alive():
+            print_t("[S] Waiting for task thread to terminate...")
             self.current_task_thread.join(timeout=5.0)
             if self.current_task_thread.is_alive():
                 print_t("[S] Warning: Task thread did not terminate cleanly")
+            else:
+                print_t("[S] Task thread terminated successfully")
+
+        # Clear the message queue to prevent stale messages
+        print_t("[S] Clearing message queue...")
+        cleared_count = 0
+        while not self.message_queue.empty():
+            try:
+                self.message_queue.get_nowait()
+                cleared_count += 1
+            except queue.Empty:
+                break
+        print_t(f"[S] Cleared {cleared_count} messages from queue")
 
         # Reset controller state
         self.llm_controller.controller_active = True
+        self.llm_controller.cancellation_event.clear()
         self.task_cancelled = False
-        print_t("[S] Task cancellation complete")
+        self.task_in_progress = False
+
+        print_t("[S] ========== CANCELLATION COMPLETE ==========")
 
     def execute_task_safely(self, message):
-        """Execute task with cancellation support"""
+        """Execute task with enhanced error handling and cancellation support"""
         try:
+            print_t(f"[S] ========== TASK THREAD START ==========")
             print_t(f"[S] Starting task execution: {message}")
+            self.task_in_progress = True
+
+            # Call the controller's execute method
             self.llm_controller.execute_task_description(message)
+
             print_t(f"[S] Task execution completed: {message}")
+            print_t(f"[S] ========== TASK THREAD END ==========")
+
         except Exception as e:
             print_t(f"[S] Task execution failed: {e}")
             self.message_queue.put(f"[ERROR] Task failed: {e}")
             self.message_queue.put('end')
+        finally:
+            self.task_in_progress = False
 
     def process_message(self, message, history):
+        print_t(f"[S] ========== MESSAGE PROCESSING START ==========")
         print_t(f"[S] Receiving task description: {message}")
 
         if message == "exit":
@@ -105,65 +133,91 @@ class TypeFly:
             yield "[WARNING] Empty command!"
             return
 
-        # ========== CONCURRENT EXECUTION HANDLING ==========
+        # ENHANCED CONCURRENT EXECUTION HANDLING
         with self.task_lock:
             # Cancel any running task
             if self.current_task_thread and self.current_task_thread.is_alive():
-                print_t("[S] ⚠️ New task received while previous task running - cancelling previous task")
+                print_t("[S] ⚠️ New task received while previous task running")
                 yield "⚠️ Cancelling previous task..."
+
+                # Cancel the previous task
                 self.cancel_current_task()
-
-                # Clear any pending messages from previous task
-                while not self.message_queue.empty():
-                    try:
-                        self.message_queue.get_nowait()
-                    except queue.Empty:
-                        break
-
                 yield "✅ Previous task cancelled. Starting new task..."
+
+                # Small delay to ensure cleanup is complete
+                time.sleep(0.5)
 
             # Start new task
             print_t(f"[S] Starting new task thread for: {message}")
             self.current_task_thread = Thread(target=self.execute_task_safely, args=(message,))
+            self.current_task_thread.daemon = True
             self.current_task_thread.start()
 
-        # Process messages from the task
+        # ENHANCED MESSAGE PROCESSING
         complete_response = ''
         start_time = time.time()
+        last_activity_time = time.time()
+        message_count = 0
 
         while True:
             try:
-                # Add timeout to prevent hanging
-                msg = self.message_queue.get(timeout=1.0)
+                msg = self.message_queue.get(timeout=2.0)
+                last_activity_time = time.time()
+                message_count += 1
+
             except queue.Empty:
                 # Check if thread is still alive
                 if not self.current_task_thread.is_alive():
                     print_t("[S] Task thread terminated without sending 'end' message")
-                    yield complete_response + "\n[Task ended unexpectedly]"
+                    if self.task_in_progress:
+                        yield complete_response + "\n⚠️ Task ended unexpectedly"
+                    else:
+                        yield complete_response + "\n✅ Task completed"
                     return
-                # Check for timeout (e.g., 60 seconds)
-                if time.time() - start_time > 60:
+
+                # Check for overall timeout (5 minutes)
+                if time.time() - start_time > 300:
                     print_t("[S] Task timeout - cancelling")
                     self.cancel_current_task()
-                    yield complete_response + "\n[Task timed out and was cancelled]"
+                    yield complete_response + "\n⚠️ Task timed out and was cancelled"
                     return
+
+                # Check for inactivity timeout (30 seconds)
+                if time.time() - last_activity_time > 30:
+                    print_t("[S] Task inactivity timeout - checking status")
+                    if not self.current_task_thread.is_alive():
+                        print_t("[S] Task thread died during inactivity")
+                        yield complete_response + "\n⚠️ Task stopped unexpectedly"
+                        return
+
                 continue
 
+            # Handle different message types
             if isinstance(msg, tuple):
                 # Image message
+                print_t(f"[S] Received image message: {msg}")
                 history.append((None, msg))
+
             elif isinstance(msg, str):
                 if msg == 'end':
-                    print_t("[S] Task completed successfully")
-                    return "✅ Command Complete!"
+                    print_t(f"[S] Task completed successfully (processed {message_count} messages)")
+                    yield complete_response + "\n✅ Task completed successfully!"
+                    return
 
-                if msg.startswith('[LOG]'):
-                    complete_response += '\n'
+                # Process text messages
+                print_t(f"[S] Processing message: {msg[:50]}...")
+
+                # Handle streaming messages (those ending with \\)
                 if msg.endswith('\\\\'):
                     complete_response += msg.rstrip('\\\\')
                 else:
-                    complete_response += msg + '\n'
+                    # Regular messages get a newline
+                    if msg.startswith('[LOG]'):
+                        complete_response += '\n' + msg
+                    else:
+                        complete_response += msg + '\n'
 
+            # Yield the updated response
             yield complete_response
 
     def generate_mjpeg_stream(self):
@@ -184,10 +238,12 @@ class TypeFly:
         print_t("[S] Starting TypeFly system...")
 
         asyncio_thread = Thread(target=self.asyncio_loop.run_forever)
+        asyncio_thread.daemon = True
         asyncio_thread.start()
 
         self.llm_controller.start_robot()
         llmc_thread = Thread(target=self.llm_controller.capture_loop, args=(self.asyncio_loop,))
+        llmc_thread.daemon = True
         llmc_thread.start()
 
         app = Flask(__name__)
@@ -197,7 +253,8 @@ class TypeFly:
             return Response(self.generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
         flask_thread = Thread(target=app.run,
-                              kwargs={'host': 'localhost', 'port': 50000, 'debug': True, 'use_reloader': False})
+                              kwargs={'host': 'localhost', 'port': 50000, 'debug': False, 'use_reloader': False})
+        flask_thread.daemon = True
         flask_thread.start()
 
         print_t("[S] Launching Gradio interface...")
@@ -216,10 +273,12 @@ class TypeFly:
 
         # Cancel any running tasks
         if self.current_task_thread and self.current_task_thread.is_alive():
+            print_t("[S] Cancelling running task before shutdown...")
             self.cancel_current_task()
 
-        llmc_thread.join()
-        asyncio_thread.join()
+        # Wait for threads to finish
+        if self.current_task_thread and self.current_task_thread.is_alive():
+            self.current_task_thread.join(timeout=5)
 
         self.llm_controller.stop_robot()
 
