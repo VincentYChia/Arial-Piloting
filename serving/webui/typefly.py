@@ -1,250 +1,311 @@
-import queue
-import sys, os
-import asyncio
-import io, time
-import gradio as gr
-from flask import Flask, Response
-from threading import Thread, Lock
+#!/usr/bin/env python3
+"""
+Ollama MiniSpec Model Testing Script
+Tests multiple Ollama models with MiniSpec code generation task
+"""
+
+import requests
+import json
+import csv
+import time
+from datetime import datetime
 import argparse
-import threading
-
-PARENT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-sys.path.append(PARENT_DIR)
-from controller.llm_controller import LLMController
-from controller.utils import print_t
-from controller.llm_wrapper import GPT4, LLAMA3, TINY_LLAMA
-from controller.abs.robot_wrapper import RobotType
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+import sys
 
 
-class TypeFly:
-    def __init__(self, robot_type, use_http=False):
-        # create a cache folder
-        self.cache_folder = os.path.join(CURRENT_DIR, 'cache')
-        if not os.path.exists(self.cache_folder):
-            os.makedirs(self.cache_folder)
-        self.message_queue = queue.Queue()
-        self.message_queue.put(self.cache_folder)
-        self.llm_controller = LLMController(robot_type, use_http, self.message_queue)
-        self.system_stop = False
-        self.ui = gr.Blocks(title="TypeFly")
-        self.asyncio_loop = asyncio.get_event_loop()
-        self.use_llama3 = False
+class OllamaModelTester:
+    def __init__(self, base_url="http://localhost:11434"):
+        self.base_url = base_url
+        self.minispec_prompt = """You are a MiniSpec code generator. Given reasoning about a robot task, generate the appropriate MiniSpec program to execute the plan.
+Available Skills
+High-level skills:
+s (scan): Rotate to find object when not in current scene
+sa (scan_abstract): Rotate to find abstract object by description when not in current scene
+Low-level skills:
+Movement: mf (move_forward), mb (move_backward), ml (move_left), mr (move_right), mu (move_up), md (move_down)
+Rotation: tc (turn_cw), tu (turn_ccw)
+Utilities: d (delay), tp (take_picture), rp (re_plan), t (time)
+Vision: iv (is_visible), ox (object_x), oy (object_y), ow (object_width), oh (object_height), od (object_dis)
+Logic: p (probe), l (log), g (goto)
+Rules
+Use high-level skills when available
+Invoke skills using their short names
+If a skill has no arguments, call it without parentheses
+Generate response as a single MiniSpec program sentence
+All statements must end with ;
+Conditionals must start with ? - Format: ?condition{{statements}};
+Use single quotes for string arguments: s('object')
+Reasoning Input
+{reasoning}
 
-        # ========== CONCURRENT EXECUTION PROTECTION ==========
-        self.task_lock = Lock()  # Prevents concurrent task execution
-        self.current_task_thread = None
-        self.task_cancelled = False
+Generate the Minispec Program:
+"""
 
-        default_sentences = [
-            "Find something I can eat.",
-            "What you can see?",
-            "Follow that ball for 20 seconds",
-            "Find a chair for me.",
-            "Go to the chair without book.",
-        ]
-        with self.ui:
-            gr.HTML(open(os.path.join(CURRENT_DIR, 'header.html'), 'r').read())
-            gr.HTML(open(os.path.join(CURRENT_DIR, 'drone-pov.html'), 'r').read())
-            gr.ChatInterface(self.process_message, retry_btn=None, fill_height=False,
-                             examples=default_sentences).queue()
-            # Fixed checkbox for dual-model architecture
-            # gr.Checkbox(label='Use llama3', value=False).select(self.checkbox_llama3)
+        self.reasoning_input = "no bottle instance in the scene, so we use scan to find bottle"
 
-    def checkbox_llama3(self):
-        """Fixed for dual-model architecture"""
-        self.use_llama3 = not self.use_llama3
-        if self.use_llama3:
-            print_t(f"[S] Switching to LLAMA3 for both reasoning and minispec models")
-            self.llm_controller.set_reasoning_model(LLAMA3)
-            self.llm_controller.set_minispec_model(LLAMA3)
+        # Results tracking
+        self.results = []
+        self.seen_outputs = set()  # Track duplicates
+
+    def test_model(self, model_name, temperature=0.0):
+        """Test a single model with given temperature"""
+        prompt = self.minispec_prompt.format(reasoning=self.reasoning_input)
+
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature
+            }
+        }
+
+        try:
+            print(f"Testing {model_name} (temp: {temperature})...")
+
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json=payload,
+                timeout=15
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            output = result.get('response', '').strip()
+
+            # Analyze the output
+            analysis = self.analyze_output(output)
+
+            # Record result
+            result_data = {
+                'model': model_name,
+                'temperature': temperature,
+                'timestamp': datetime.now().isoformat(),
+                'output': output,
+                'category': analysis['category'],
+                'is_valid_minispec': analysis['is_valid_minispec'],
+                'is_duplicate': analysis['is_duplicate'],
+                'notes': analysis['notes']
+            }
+
+            self.results.append(result_data)
+            self.seen_outputs.add(output)
+
+            print(f"  Result: {analysis['category']}")
+            return result_data
+
+        except requests.exceptions.RequestException as e:
+            print(f"  Error testing {model_name}: {e}")
+            error_data = {
+                'model': model_name,
+                'temperature': temperature,
+                'timestamp': datetime.now().isoformat(),
+                'output': f"REQUEST_ERROR: {str(e)}",
+                'category': 'request_error',
+                'is_valid_minispec': False,
+                'is_duplicate': False,
+                'notes': f"Request failed: {str(e)}"
+            }
+            self.results.append(error_data)
+            return error_data
+
+    def validate_minispec(self, output):
+        """Validate if output is valid MiniSpec syntax"""
+        try:
+            import re
+
+            # Remove whitespace
+            code = output.strip()
+
+            # Check if empty
+            if not code:
+                return False, "Empty output"
+
+            # Check if ends with semicolon
+            if not code.endswith(';'):
+                return False, "Missing semicolon"
+
+            # Basic pattern matching for MiniSpec syntax
+            # Function calls: word() or word('arg') or word("arg")
+            func_pattern = r"\b[a-z_][a-z0-9_]*\s*\([^)]*\)"
+
+            # Conditionals: ?condition{...}
+            conditional_pattern = r"\?[^{]+\{[^}]*\}"
+
+            # Simple statements: word; or word();
+            simple_pattern = r"\b[a-z_][a-z0-9_]*\s*;"
+
+            # Check for basic MiniSpec patterns
+            has_function = bool(re.search(func_pattern, code, re.IGNORECASE))
+            has_conditional = bool(re.search(conditional_pattern, code))
+            has_simple = bool(re.search(simple_pattern, code, re.IGNORECASE))
+
+            # Check for invalid characters or patterns
+            # Allow alphanumeric, quotes, parentheses, semicolons, question marks, braces, equals, underscores
+            valid_chars = re.match(r"^[a-zA-Z0-9_'\"()\{\};?=\s<>!&|]*$", code)
+
+            if not valid_chars:
+                return False, "Contains invalid characters"
+
+            # Check balanced braces and parentheses
+            brace_count = code.count('{') - code.count('}')
+            paren_count = code.count('(') - code.count(')')
+
+            if brace_count != 0:
+                return False, "Unbalanced braces"
+            if paren_count != 0:
+                return False, "Unbalanced parentheses"
+
+            # If we have valid patterns and structure, consider it valid
+            if has_function or has_conditional or has_simple:
+                return True, "Valid MiniSpec syntax"
+            else:
+                return False, "No valid MiniSpec patterns found"
+
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+
+    def analyze_output(self, output):
+        """Analyze model output and categorize result"""
+        is_duplicate = output in self.seen_outputs
+
+        # Validate MiniSpec syntax
+        is_valid_minispec, minispec_error = self.validate_minispec(output)
+
+        # Determine category
+        if is_duplicate:
+            category = 'duplicate'
+            notes = 'Duplicate response'
+        elif is_valid_minispec:
+            category = 'valid_minispec'
+            notes = 'Valid MiniSpec syntax'
         else:
-            print_t(f"[S] Switching to TINY_LLAMA for both reasoning and minispec models")
-            self.llm_controller.set_reasoning_model(TINY_LLAMA)
-            self.llm_controller.set_minispec_model(TINY_LLAMA)
+            category = 'invalid_syntax'
+            notes = f'Invalid syntax: {minispec_error}'
 
-    def cancel_current_task(self):
-        """Cancel the currently running task"""
-        print_t("[S] Cancelling current task...")
-        self.task_cancelled = True
-        self.llm_controller.stop_controller()
+        return {
+            'category': category,
+            'is_valid_minispec': is_valid_minispec,
+            'is_duplicate': is_duplicate,
+            'notes': notes
+        }
 
-        # Wait for current task to finish with timeout
-        if self.current_task_thread and self.current_task_thread.is_alive():
-            self.current_task_thread.join(timeout=5.0)
-            if self.current_task_thread.is_alive():
-                print_t("[S] Warning: Task thread did not terminate cleanly")
+    def test_models(self, model_list, temperatures=None):
+        """Test multiple models with given temperatures"""
+        if temperatures is None:
+            temperatures = [0.0]
 
-        # Reset controller state
-        self.llm_controller.controller_active = True
-        self.task_cancelled = False
-        print_t("[S] Task cancellation complete")
+        print(f"Testing {len(model_list)} models with temperatures: {temperatures}")
+        print(f"Reasoning input: {self.reasoning_input}")
+        print("-" * 50)
 
-    def execute_task_safely(self, message):
-        """Execute task with cancellation support"""
-        try:
-            print_t(f"[S] Starting task execution: {message}")
-            self.llm_controller.execute_task_description(message)
-            print_t(f"[S] Task execution completed: {message}")
-        except Exception as e:
-            print_t(f"[S] Task execution failed: {e}")
-            self.message_queue.put(f"[ERROR] Task failed: {e}")
-            self.message_queue.put('end')
+        for model in model_list:
+            for temp in temperatures:
+                self.test_model(model, temp)
+                time.sleep(1)  # Brief pause between requests
 
-    def process_message(self, message, history):
-        print_t(f"[S] Receiving task description: {message}")
+    def save_results(self, filename=None):
+        """Save results to CSV file"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"ollama_minispec_results_{timestamp}.csv"
 
-        if message == "exit":
-            self.llm_controller.stop_controller()
-            self.system_stop = True
-            yield "Shutting down..."
+        fieldnames = [
+            'model', 'temperature', 'timestamp', 'output', 'category',
+            'is_valid_minispec', 'is_duplicate', 'notes'
+        ]
+
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.results)
+
+        print(f"\nResults saved to: {filename}")
+        self.print_summary()
+
+    def print_summary(self):
+        """Print summary of results"""
+        if not self.results:
             return
-        elif len(message) == 0:
-            yield "[WARNING] Empty command!"
-            return
 
-        # ========== CONCURRENT EXECUTION HANDLING ==========
-        with self.task_lock:
-            # Cancel any running task
-            if self.current_task_thread and self.current_task_thread.is_alive():
-                print_t("[S] ⚠️ New task received while previous task running - cancelling previous task")
-                yield "⚠️ Cancelling previous task..."
-                self.cancel_current_task()
+        total = len(self.results)
+        categories = {}
 
-                # Clear any pending messages from previous task
-                while not self.message_queue.empty():
-                    try:
-                        self.message_queue.get_nowait()
-                    except queue.Empty:
-                        break
+        for result in self.results:
+            cat = result['category']
+            categories[cat] = categories.get(cat, 0) + 1
 
-                yield "✅ Previous task cancelled. Starting new task..."
+        print(f"\nSummary of {total} tests:")
+        for category, count in sorted(categories.items()):
+            percentage = (count / total) * 100
+            print(f"  {category}: {count} ({percentage:.1f}%)")
 
-            # Start new task
-            print_t(f"[S] Starting new task thread for: {message}")
-            self.current_task_thread = Thread(target=self.execute_task_safely, args=(message,))
-            self.current_task_thread.start()
 
-        # Process messages from the task
-        complete_response = ''
-        start_time = time.time()
+# =============================================================================
+# CONFIGURATION - Edit these settings as needed
+# =============================================================================
 
-        while True:
-            try:
-                # Add timeout to prevent hanging
-                msg = self.message_queue.get(timeout=1.0)
-            except queue.Empty:
-                # Check if thread is still alive
-                if not self.current_task_thread.is_alive():
-                    print_t("[S] Task thread terminated without sending 'end' message")
-                    yield complete_response + "\n[Task ended unexpectedly]"
-                    return
-                # Check for timeout (e.g., 60 seconds)
-                if time.time() - start_time > 60:
-                    print_t("[S] Task timeout - cancelling")
-                    self.cancel_current_task()
-                    yield complete_response + "\n[Task timed out and was cancelled]"
-                    return
-                continue
+# Models to test
+MODELS = [
+    'robot-pilot-writer23:latest',
+    'robot-pilot-writer25:latest',
+    'robot-pilot-writer26:latest',
+    'robot-pilot-writer27:latest',
+    'robot-pilot-writer28:latest',
 
-            if isinstance(msg, tuple):
-                # Image message
-                history.append((None, msg))
-            elif isinstance(msg, str):
-                if msg == 'end':
-                    print_t("[S] Task completed successfully")
-                    return "✅ Command Complete!"
+]
 
-                if msg.startswith('[LOG]'):
-                    complete_response += '\n'
-                if msg.endswith('\\\\'):
-                    complete_response += msg.rstrip('\\\\')
-                else:
-                    complete_response += msg + '\n'
+# Temperature settings - choose ONE of these options:
 
-            yield complete_response
+# Option 1: Single temperature
+# TEMPERATURES = [0.0]
 
-    def generate_mjpeg_stream(self):
-        while True:
-            if self.system_stop:
-                break
-            frame = self.llm_controller.get_latest_frame(True)
-            if frame is None:
-                continue
-            buf = io.BytesIO()
-            frame.save(buf, format='JPEG')
-            buf.seek(0)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buf.read() + b'\r\n')
-            time.sleep(1.0 / 30.0)
+# Option 2: Multiple specific temperatures
+# TEMPERATURES = [0.0, 0.5, 1.0]
 
-    def run(self):
-        print_t("[S] Starting TypeFly system...")
+# Option 3: Temperature range
+TEMP_START = 0.0
+TEMP_END = 0.5
+TEMP_STEP = 0.1
 
-        asyncio_thread = Thread(target=self.asyncio_loop.run_forever)
-        asyncio_thread.start()
+# Other settings
+OLLAMA_BASE_URL = "http://localhost:11434"
+OUTPUT_FILENAME = None  # None = auto-generate with timestamp
 
-        self.llm_controller.start_robot()
-        llmc_thread = Thread(target=self.llm_controller.capture_loop, args=(self.asyncio_loop,))
-        llmc_thread.start()
 
-        app = Flask(__name__)
+# =============================================================================
 
-        @app.route('/drone-pov/')
-        def video_feed():
-            return Response(self.generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+def generate_temperature_range(start, end, step):
+    """Generate temperature range"""
+    temps = []
+    temp = start
+    while temp <= end:
+        temps.append(round(temp, 1))
+        temp += step
+    return temps
 
-        flask_thread = Thread(target=app.run,
-                              kwargs={'host': 'localhost', 'port': 50000, 'debug': True, 'use_reloader': False})
-        flask_thread.start()
 
-        print_t("[S] Launching Gradio interface...")
-        self.ui.launch(show_api=False, server_port=50001, prevent_thread_lock=True)
+def main():
+    # Use temperature range if TEMP_START is defined, otherwise use TEMPERATURES
+    try:
+        temperatures = generate_temperature_range(TEMP_START, TEMP_END, TEMP_STEP)
+    except NameError:
+        temperatures = TEMPERATURES
 
-        try:
-            while True:
-                time.sleep(1)
-                if self.system_stop:
-                    break
-        except KeyboardInterrupt:
-            print_t("[S] Keyboard interrupt received")
-            self.system_stop = True
+    # Initialize tester
+    tester = OllamaModelTester(base_url=OLLAMA_BASE_URL)
 
-        print_t("[S] Shutting down TypeFly...")
-
-        # Cancel any running tasks
-        if self.current_task_thread and self.current_task_thread.is_alive():
-            self.cancel_current_task()
-
-        llmc_thread.join()
-        asyncio_thread.join()
-
-        self.llm_controller.stop_robot()
-
-        # Clean cache folder
-        try:
-            for file in os.listdir(self.cache_folder):
-                os.remove(os.path.join(self.cache_folder, file))
-            print_t("[S] Cache folder cleaned")
-        except Exception as e:
-            print_t(f"[S] Error cleaning cache: {e}")
+    # Run tests
+    try:
+        tester.test_models(MODELS, temperatures)
+        tester.save_results(OUTPUT_FILENAME)
+    except KeyboardInterrupt:
+        print("\nTesting interrupted by user")
+        if tester.results:
+            print("Saving partial results...")
+            tester.save_results(OUTPUT_FILENAME)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--use_virtual_robot', action='store_true')
-    parser.add_argument('--use_http', action='store_true')
-    parser.add_argument('--gear', action='store_true')
-
-    args = parser.parse_args()
-    robot_type = RobotType.TELLO
-    if args.use_virtual_robot:
-        robot_type = RobotType.VIRTUAL
-    elif args.gear:
-        robot_type = RobotType.GEAR
-
-    print_t(f"[S] Starting TypeFly with robot type: {robot_type}")
-    typefly = TypeFly(robot_type, use_http=args.use_http)
-    typefly.run()
+    main()
