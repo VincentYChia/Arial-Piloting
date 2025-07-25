@@ -1,0 +1,63 @@
+# YoloE Docker Image - Clean Version
+FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    MKL_THREADING_LAYER=GNU \
+    OMP_NUM_THREADS=1 \
+    ROOT_PATH=/workspace \
+    YOLOE_SERVICE_PORT="50053,50054"
+
+# Install system packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc git zip unzip wget curl htop libgl1 libglib2.0-0 libpython3-dev gnupg g++ libusb-1.0-0 libsm6 nano \
+    && rm -rf /var/lib/apt/lists/*
+
+# Security updates
+RUN apt upgrade --no-install-recommends -y openssl tar
+
+# Install base Python packages
+RUN python3 -m pip install --upgrade pip wheel
+RUN pip install grpcio-tools lapx
+
+# Clone and install YoloE
+RUN git clone https://github.com/THU-MIG/yoloe.git /tmp/yoloe
+WORKDIR /tmp/yoloe
+RUN pip install -r requirements.txt
+RUN pip install git+https://github.com/THU-MIG/yoloe.git#subdirectory=third_party/CLIP
+RUN pip install git+https://github.com/THU-MIG/yoloe.git#subdirectory=third_party/ml-mobileclip
+RUN pip install git+https://github.com/THU-MIG/yoloe.git#subdirectory=third_party/lvis-api
+RUN pip install -e .
+
+# Download YoloE models and MobileCLIP
+RUN mkdir -p /tmp/models
+RUN wget -P /tmp/models/ https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/mobileclip_blt.pt
+RUN pip install huggingface-hub
+RUN python -c "from huggingface_hub import hf_hub_download; hf_hub_download('jameslahm/yoloe', 'yoloe-11s-seg.pt', local_dir='/tmp/models')"
+
+# Install ultralytics AFTER YoloE (YoloE may override it)
+RUN pip uninstall ultralytics -y || true
+RUN pip install ultralytics
+
+# Copy workspace (like your original YOLO Dockerfile)
+COPY ../.. /workspace
+WORKDIR /workspace
+RUN mkdir -p /workspace/proto/generated
+RUN mkdir -p /workspace/serving/yoloe/models
+
+# Copy YoloE models to workspace and rename for service
+RUN cp /tmp/models/* /workspace/serving/yoloe/models/ 2>/dev/null || true
+RUN if [ -f "/workspace/serving/yoloe/models/yoloe-11s-seg.pt" ]; then cp /workspace/serving/yoloe/models/yoloe-11s-seg.pt /workspace/serving/yoloe/models/yoloe_n.pt; fi
+
+# Clean up temporary files
+RUN rm -rf /tmp/yoloe /tmp/models
+
+# Expose YoloE ports
+EXPOSE 50053 50054
+
+# Run YoloE service
+CMD ["python", "yoloe_service.py"]

@@ -146,23 +146,38 @@ class SimpleCsvLogger:
 
 class LLMPlanner():
     def __init__(self, robot_type: RobotType):
-        print_t("[P] Initializing dual-model LLM planner with probe support...")
+        print_t("[P] Initializing enhanced dual-model LLM planner with VLM reasoning replacement capability...")
 
         # MODEL CONFIGURATION (EASILY MODIFIABLE)
-        # Both models use local Ollama for now
-        self.reasoning_model = "robot-pilot-reason11"
-        self.minispec_model = "robot-pilot-writer23"
+        # Core models
+        self.reasoning_model = "qwen3-4b-reasoning_1"
+        self.minispec_model = "qwen3-4b-writing_13"
+
+        # NEW: Enhanced models for VLM and replan assessment
+        self.vlm_model = "qwen-2.5vl"
+        self.replan_model = "qwen3:4b"
 
         # Temperature settings for each model
-        self.reasoning_temperature = 0.5  # Slightly higher for reasoning creativity
+        self.reasoning_temperature = 0.3  # Slightly higher for reasoning creativity
         self.minispec_temperature = 0.0  # Very low for precise code generation
+        self.vlm_temperature = 0.3  # NEW: VLM temperature
+        self.replan_temperature = 0.2  # NEW: Replan temperature
+
+        # NEW: VLM configuration
+        self.vlm_enabled = True
+        self.use_vlm_for_reasoning = False  # NEW: Flag to use VLM as reasoning replacement
 
         print_t(f"[P] Reasoning model: {self.reasoning_model} (temp: {self.reasoning_temperature})")
         print_t(f"[P] MiniSpec model: {self.minispec_model} (temp: {self.minispec_temperature})")
+        print_t(f"[P] VLM model: {self.vlm_model} (temp: {self.vlm_temperature}, enabled: {self.vlm_enabled})")
+        print_t(f"[P] VLM reasoning mode: {self.use_vlm_for_reasoning}")
+        print_t(f"[P] Replan model: {self.replan_model} (temp: {self.replan_temperature})")
 
-        # Initialize two separate LLM instances
+        # Initialize LLM instances
         self.reasoning_llm = LLMWrapper(temperature=self.reasoning_temperature)
         self.minispec_llm = LLMWrapper(temperature=self.minispec_temperature)
+        self.vlm_llm = LLMWrapper(temperature=self.vlm_temperature)  # NEW: VLM instance
+        self.replan_llm = LLMWrapper(temperature=self.replan_temperature)  # NEW: Replan instance
 
         self.robot_type = robot_type
         type_folder_name = 'tello'
@@ -177,13 +192,14 @@ class LLMPlanner():
         # Initialize inline prompts
         self._init_prompts()
 
-        print_t("[P] Dual-model planner with probe support initialized successfully")
+        print_t("[P] Enhanced dual-model planner with VLM reasoning replacement capability initialized successfully")
 
     def _init_prompts(self):
         """Initialize all prompts as inline strings matching fine-tuning format"""
-        print_t("[P] Loading inline prompts...")
+        print_t("[P] Loading enhanced inline prompts...")
 
         # STAGE 1: REASONING PROMPT - MATCHING FINE-TUNING FORMAT
+        # This prompt will be used for both reasoning model and VLM reasoning
         self.reasoning_prompt = """You are a robot pilot reasoning system. Analyze the given scene and task to provide detailed reasoning about what actions should be taken.
 ## Available Skills
 High-level skills:
@@ -276,6 +292,26 @@ Scene Description:{scene_description}
 Question:{question}
 Please give the content of results only, don't include 'Output:' in the results."""
 
+        # NEW: REPLAN ASSESSMENT PROMPT
+        self.replan_assessment_prompt = """Assess the current state of a robot task execution and determine next steps.
+
+Original Task: {original_task}
+Past Reasoning: {past_reasoning}
+Executed Commands: {executed_commands}
+Current Scene: {current_scene}
+
+Analyze the situation and provide:
+1. Overall progress assessment (0-100%)
+2. Whether the task is complete, should continue, or needs a different approach
+3. Specific feedback or guidance for next steps
+
+Provide assessment in this format:
+Decision: COMPLETE/CONTINUE/REPLAN
+Progress: [0-100]
+Feedback: [Brief explanation and guidance]
+
+Assessment:"""
+
         # Load additional data from files for reasoning stage
         try:
             with open(os.path.join(CURRENT_DIR, f"./assets/{self.type_folder_name}/guides.txt"), "r") as f:
@@ -285,7 +321,7 @@ Please give the content of results only, don't include 'Output:' in the results.
             print_t(f"[P] Warning: Could not load guides: {e}")
             self.guides = "Follow task instructions carefully and use appropriate skills."
 
-    # MODEL CONFIGURATION METHODS
+    # ========== NEW: MODEL CONFIGURATION METHODS ==========
     def set_reasoning_model(self, model_name: str, temperature: float = None):
         """Set the model and temperature for reasoning stage"""
         self.reasoning_model = model_name
@@ -302,6 +338,28 @@ Please give the content of results only, don't include 'Output:' in the results.
             self.minispec_llm = LLMWrapper(temperature=temperature)
         print_t(f"[P] MiniSpec model updated: {model_name} (temp: {self.minispec_temperature})")
 
+    def set_vlm_model(self, model_name: str, temperature: float = None, enabled: bool = True):
+        """Set the VLM model and configuration"""
+        self.vlm_model = model_name
+        if temperature is not None:
+            self.vlm_temperature = temperature
+            self.vlm_llm = LLMWrapper(temperature=temperature)
+        self.vlm_enabled = enabled
+        print_t(f"[P] VLM model updated: {model_name} (temp: {self.vlm_temperature}, enabled: {enabled})")
+
+    def set_replan_model(self, model_name: str, temperature: float = None):
+        """Set the replan assessment model"""
+        self.replan_model = model_name
+        if temperature is not None:
+            self.replan_temperature = temperature
+            self.replan_llm = LLMWrapper(temperature=temperature)
+        print_t(f"[P] Replan model updated: {model_name} (temp: {self.replan_temperature})")
+
+    def enable_vlm_reasoning(self, enabled: bool = True):
+        """Enable or disable VLM as reasoning model replacement"""
+        self.use_vlm_for_reasoning = enabled
+        print_t(f"[P] VLM reasoning mode: {'enabled' if enabled else 'disabled'}")
+
     def init(self, high_level_skillset: SkillSet, low_level_skillset: SkillSet, vision_skill: VisionSkillWrapper):
         """Initialize skillsets and vision"""
         print_t("[P] Initializing skillsets and vision...")
@@ -311,41 +369,89 @@ Please give the content of results only, don't include 'Output:' in the results.
         print_t("[P] Skillsets and vision initialized")
 
     def plan_reasoning(self, task_description: str, scene_description: str,
-                       execution_history: Optional[str] = None) -> str:
-        """Stage 1: Generate reasoning for the task"""
+                       execution_history: Optional[str] = None, image_path: Optional[str] = None,
+                       force_vlm: bool = None) -> Tuple[str, str]:
+        """
+        Stage 1: Generate reasoning using either reasoning model or VLM
+
+        Args:
+            task_description: Natural language task description
+            scene_description: Current scene objects
+            execution_history: Previous execution history (optional)
+            image_path: Camera image for VLM reasoning (optional)
+            force_vlm: Override to force VLM usage (optional)
+
+        Returns:
+            Tuple[str, str]: (reasoning_text, model_used)
+        """
         print_t("[P] ====== STAGE 1: REASONING ======")
         print_t(f"[P] Task: {task_description}")
         print_t(f"[P] Scene: {scene_description}")
         print_t(f"[P] History: {execution_history}")
+        print_t(f"[P] Image available: {image_path is not None}")
+
+        # Determine which model to use
+        should_use_vlm = force_vlm if force_vlm is not None else (
+                self.use_vlm_for_reasoning and self.vlm_enabled and image_path is not None
+        )
+
+        if should_use_vlm:
+            print_t(f"[P] Using VLM for reasoning: {self.vlm_model}")
+            model_to_use = self.vlm_model
+            llm_to_use = self.vlm_llm
+            model_type = "VLM"
+        else:
+            print_t(f"[P] Using reasoning model: {self.reasoning_model}")
+            model_to_use = self.reasoning_model
+            llm_to_use = self.reasoning_llm
+            model_type = "REASONING"
 
         start_time = time.time()
 
-        # Format the reasoning prompt - MATCHING FINE-TUNING FORMAT
+        # Use same prompt format for both models
         prompt = self.reasoning_prompt.format(
             scene_description=scene_description,
             task_description=task_description,
             execution_history=execution_history or "None"
         )
 
-        print_t(f"[P] Sending reasoning request to model: {self.reasoning_model}")
+        print_t(f"[P] Sending reasoning request to model: {model_to_use}")
         print_t(f"[P] Reasoning prompt length: {len(prompt)} characters")
         print_t(f"[P] Reasoning prompt preview: {prompt[:200]}...")
 
-        # Make the LLM call
-        response = self.reasoning_llm.request(prompt, self.reasoning_model, stream=False)
+        try:
+            # Make the LLM call (with image if using VLM)
+            if should_use_vlm and image_path:
+                response = llm_to_use.request(
+                    prompt=prompt,
+                    model_name=model_to_use,
+                    image_path=image_path,
+                    stream=False
+                )
+            else:
+                response = llm_to_use.request(prompt, model_to_use, stream=False)
 
-        reasoning_time = time.time() - start_time
-        print_t(f"[P] Reasoning completed in {reasoning_time:.2f}s")
-        print_t(f"[P] Raw reasoning response: {response}")
+            reasoning_time = time.time() - start_time
+            print_t(f"[P] Reasoning completed in {reasoning_time:.2f}s using {model_type}")
+            print_t(f"[P] Raw reasoning response: {response}")
 
-        # Extract reasoning (remove "Reason:" prefix if present)
-        if response.startswith("Reason:"):
-            reasoning = response[7:].strip()
-        else:
-            reasoning = response.strip()
+            # Extract reasoning (remove "Reason:" prefix if present)
+            if response.startswith("Reason:"):
+                reasoning = response[7:].strip()
+            else:
+                reasoning = response.strip()
 
-        print_t(f"[P] Extracted reasoning: {reasoning}")
-        return reasoning
+            print_t(f"[P] Extracted reasoning: {reasoning}")
+            return reasoning, model_to_use
+
+        except Exception as e:
+            print_t(f"[P] Error in {model_type} reasoning: {e}")
+            # Fallback to the other model if available
+            if should_use_vlm and not force_vlm:
+                print_t("[P] Falling back to reasoning model due to VLM error")
+                return self.plan_reasoning(task_description, scene_description, execution_history, None, False)
+            else:
+                raise e
 
     def plan_minispec(self, reasoning: str) -> str:
         """Stage 2: Generate MiniSpec code based ONLY on reasoning"""
@@ -382,14 +488,23 @@ Please give the content of results only, don't include 'Output:' in the results.
         return code
 
     def plan(self, task_description: str, scene_description: Optional[str] = None, error_message: Optional[str] = None,
-             execution_history: Optional[str] = None) -> Tuple[str, str]:
+             execution_history: Optional[str] = None, image_path: Optional[str] = None,
+             use_vlm_for_reasoning: bool = None) -> Tuple[str, str]:
         """
-        Main planning method - orchestrates reasoning and MiniSpec generation
+        Enhanced main planning method with VLM reasoning replacement capability
+
+        Args:
+            task_description: Natural language task description
+            scene_description: Current scene objects (optional)
+            error_message: Error context (optional)
+            execution_history: Previous execution history (optional)
+            image_path: Camera image for VLM reasoning (optional)
+            use_vlm_for_reasoning: Override VLM usage for reasoning (None=auto, True=force VLM, False=force reasoning model)
 
         Returns:
             Tuple[str, str]: (reasoning, minispec_code)
         """
-        print_t("[P] ========== DUAL-STAGE PLANNING START ==========")
+        print_t("[P] ========== ENHANCED DUAL-STAGE PLANNING START ==========")
         total_start_time = time.time()
 
         # Prepare task description
@@ -403,26 +518,34 @@ Please give the content of results only, don't include 'Output:' in the results.
             print_t(f"[P] Retrieved scene description: {scene_description}")
 
         try:
-            # Stage 1: Generate reasoning (gets full context)
-            reasoning = self.plan_reasoning(task_description, scene_description, execution_history)
+            # Stage 1: Generate reasoning (using either reasoning model or VLM)
+            reasoning, actual_reasoning_model = self.plan_reasoning(
+                task_description, scene_description, execution_history, image_path, use_vlm_for_reasoning
+            )
 
             # Stage 2: Generate MiniSpec code (gets ONLY reasoning)
             code = self.plan_minispec(reasoning)
 
             total_time = time.time() - total_start_time
-            print_t(f"[P] ========== DUAL-STAGE PLANNING COMPLETE in {total_time:.2f}s ==========")
+            print_t(f"[P] ========== ENHANCED DUAL-STAGE PLANNING COMPLETE in {total_time:.2f}s ==========")
             print_t(f"[P] Final reasoning: {reasoning}")
             print_t(f"[P] Final MiniSpec code: {code}")
+            print_t(f"[P] Actual reasoning model used: {actual_reasoning_model}")
 
-            # Log successful operation
+            # Log successful operation with actual model used
+            actual_reasoning_temperature = (
+                self.vlm_temperature if actual_reasoning_model == self.vlm_model
+                else self.reasoning_temperature
+            )
+
             self.csv_logger.log(
                 user_input=task_description,
                 model1_reasoning=reasoning,
                 model2_minispec=code,
                 execution_time=total_time,
-                reasoning_model=self.reasoning_model,
+                reasoning_model=actual_reasoning_model,
                 minispec_model=self.minispec_model,
-                reasoning_temperature=self.reasoning_temperature,
+                reasoning_temperature=actual_reasoning_temperature,
                 minispec_temperature=self.minispec_temperature,
                 errors=error_message or ""
             )
@@ -430,7 +553,7 @@ Please give the content of results only, don't include 'Output:' in the results.
             return reasoning, code
 
         except Exception as e:
-            print_t(f"[P] ERROR in dual-stage planning: {e}")
+            print_t(f"[P] ERROR in enhanced dual-stage planning: {e}")
             print_t(f"[P] Returning fallback response")
 
             # Log failed operation
@@ -447,6 +570,51 @@ Please give the content of results only, don't include 'Output:' in the results.
             )
 
             return f"Error in planning: {e}", "log('Planning failed')"
+
+    # ========== NEW: REPLAN ASSESSMENT ==========
+    def assess_replan(self, original_task: str, past_reasoning: str, executed_commands: str,
+                      current_scene: str) -> Tuple[str, int, str]:
+        """Enhanced replan assessment using dedicated replan model"""
+        print_t(f"[P] === REPLAN ASSESSMENT ===")
+        print_t(f"[P] Original task: {original_task}")
+        print_t(f"[P] Current scene: {current_scene}")
+
+        try:
+            prompt = self.replan_assessment_prompt.format(
+                original_task=original_task,
+                past_reasoning=past_reasoning,
+                executed_commands=executed_commands,
+                current_scene=current_scene
+            )
+
+            print_t(f"[P] Sending replan assessment to model: {self.replan_model}")
+            response = self.replan_llm.request(prompt, self.replan_model, stream=False)
+
+            print_t(f"[P] Replan assessment response: {response}")
+
+            # Parse response
+            lines = response.strip().split('\n')
+            decision = "CONTINUE"
+            progress = 50
+            feedback = response
+
+            for line in lines:
+                if 'Decision:' in line:
+                    decision = line.split(':', 1)[1].strip()
+                elif 'Progress:' in line:
+                    try:
+                        progress = int(line.split(':', 1)[1].strip().replace('%', ''))
+                    except:
+                        pass
+                elif 'Feedback:' in line:
+                    feedback = line.split(':', 1)[1].strip()
+
+            print_t(f"[P] Parsed assessment: {decision}, {progress}%, {feedback}")
+            return decision, progress, feedback
+
+        except Exception as e:
+            print_t(f"[P] Error in replan assessment: {e}")
+            return "CONTINUE", 50, "Assessment failed, continuing"
 
     # PROBE FUNCTIONALITY RESTORED
     def probe(self, question: str) -> Tuple[MiniSpecValueType, bool]:

@@ -378,6 +378,18 @@ class Statement:
         operand_2 = self.eval_expr(operand_2)
         if operand_2.replan:
             return operand_2
+        # FIX: Convert string representations of booleans back to booleans
+        if isinstance(operand_1.value, str):
+            if operand_1.value == 'True':
+                operand_1.value = True
+            elif operand_1.value == 'False':
+                operand_1.value = False
+
+        if isinstance(operand_2.value, str):
+            if operand_2.value == 'True':
+                operand_2.value = True
+            elif operand_2.value == 'False':
+                operand_2.value = False
 
         print_debug(f'Condition ops: {operand_1.value} {comparator} {operand_2.value}')
         if type(operand_1.value) == int and type(operand_2.value) == float or \
