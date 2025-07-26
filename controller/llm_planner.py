@@ -154,8 +154,8 @@ class LLMPlanner():
         self.minispec_model = "qwen3-4b-writing_13"
 
         # NEW: Enhanced models for VLM and replan assessment
-        self.vlm_model = "qwen-2.5vl"
-        self.replan_model = "qwen3:4b"
+        self.vlm_model = "qwen2.5vl"
+        self.replan_model = "qwen3:1.7b"
 
         # Temperature settings for each model
         self.reasoning_temperature = 0.3  # Slightly higher for reasoning creativity
@@ -200,7 +200,8 @@ class LLMPlanner():
 
         # STAGE 1: REASONING PROMPT - MATCHING FINE-TUNING FORMAT
         # This prompt will be used for both reasoning model and VLM reasoning
-        self.reasoning_prompt = """You are a robot pilot reasoning system. Analyze the given scene and task to provide detailed reasoning about what actions should be taken.
+        self.reasoning_prompt = """/no_think
+You are a robot pilot reasoning system. Analyze the given scene and task to provide a concise reasoning sentence about what actions should be taken.
 ## Available Skills
 High-level skills:
 s (scan): Rotate to find object when not in current scene
@@ -221,6 +222,7 @@ Analyze the scene and task, then provide detailed reasoning about:
 2. What objects/information are relevant
 3. What approach should be taken
 4. What skills or sequence of actions would be most appropriate
+5. Adding re_plan will allow for persistent tasks such as following or if/then conditional tasks to proceed smoother
 ## Current Input
 **Scene:** {scene_description}
 **Task:** {task_description}
@@ -228,7 +230,8 @@ Analyze the scene and task, then provide detailed reasoning about:
 Provide your reasoning:"""
 
         # STAGE 2: MINISPEC WRITER PROMPT - MATCHING FINE-TUNING FORMAT
-        self.minispec_prompt = """You are a MiniSpec code generator. Given reasoning about a robot task, generate the appropriate MiniSpec program to execute the plan.
+        self.minispec_prompt = """/no_think
+You are a MiniSpec code generator. Given reasoning about a robot task, generate the appropriate MiniSpec program to execute the plan.
 Available Skills
 High-level skills:
 s (scan): Rotate to find object when not in current scene
@@ -254,7 +257,8 @@ Generate the Minispec Program:
 """
 
         # PROBE PROMPT - RESTORED
-        self.probe_prompt = """You are given a scene description and a question. You should output the answer to the question based on the scene description.
+        self.probe_prompt = """/no_think
+You are given a scene description and a question. You should output the answer to the question based on the scene description.
 The scene description contains listed objects with their respective names, locations, and sizes.
 The question is a string that asks about the scene or the objects in the scene.
 For yes-or-no questions, output with 'True' or 'False' only.
@@ -292,7 +296,7 @@ Scene Description:{scene_description}
 Question:{question}
 Please give the content of results only, don't include 'Output:' in the results."""
 
-        # NEW: REPLAN ASSESSMENT PROMPT
+        # UPDATED: REPLAN ASSESSMENT PROMPT WITH REPLAN PROMPT FIELD
         self.replan_assessment_prompt = """Assess the current state of a robot task execution and determine next steps.
 
 Original Task: {original_task}
@@ -301,16 +305,18 @@ Executed Commands: {executed_commands}
 Current Scene: {current_scene}
 
 Analyze the situation and provide:
-1. Overall progress assessment (0-100%)
-2. Whether the task is complete, should continue, or needs a different approach
-3. Specific feedback or guidance for next steps
+1. Whether the task is complete, should continue, or needs a different approach
+2. Specific feedback or guidance for next steps
+
+General Guidelines:
+1. If previous task involves scanning and no object found, suggest using scan abstract
+2. If original command was to follow an object, decide if complete or an additional move prompt is necessary
 
 Provide assessment in this format:
-Decision: COMPLETE/CONTINUE/REPLAN
-Progress: [0-100]
+Decision: COMPLETE/REPLAN/CONTINUE
 Feedback: [Brief explanation and guidance]
-
-Assessment:"""
+Replan Prompt: [If replan, write a new task to help achieve the original task]
+"""
 
         # Load additional data from files for reasoning stage
         try:
@@ -321,7 +327,7 @@ Assessment:"""
             print_t(f"[P] Warning: Could not load guides: {e}")
             self.guides = "Follow task instructions carefully and use appropriate skills."
 
-    # ========== NEW: MODEL CONFIGURATION METHODS ==========
+    # ========== MODEL CONFIGURATION METHODS ==========
     def set_reasoning_model(self, model_name: str, temperature: float = None):
         """Set the model and temperature for reasoning stage"""
         self.reasoning_model = model_name
@@ -355,10 +361,28 @@ Assessment:"""
             self.replan_llm = LLMWrapper(temperature=temperature)
         print_t(f"[P] Replan model updated: {model_name} (temp: {self.replan_temperature})")
 
+    # ========== SIMPLE VLM REASONING ON/OFF TOGGLE ==========
     def enable_vlm_reasoning(self, enabled: bool = True):
-        """Enable or disable VLM as reasoning model replacement"""
+        """
+        Simple on/off switch for VLM reasoning (MAIN METHOD TO USE)
+
+        Args:
+            enabled: True = use VLM when image available (with LLM fallback)
+                    False = always use LLM only
+        """
         self.use_vlm_for_reasoning = enabled
-        print_t(f"[P] VLM reasoning mode: {'enabled' if enabled else 'disabled'}")
+        self.vlm_enabled = enabled  # FIXED: Also set vlm_enabled flag
+        print_t(f"[P] VLM reasoning: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def is_vlm_reasoning_enabled(self) -> bool:
+        """Check if VLM reasoning is currently enabled (NEW METHOD)"""
+        return self.use_vlm_for_reasoning and self.vlm_enabled
+
+    def toggle_vlm_reasoning(self) -> bool:
+        """Toggle VLM reasoning on/off and return new state (NEW METHOD)"""
+        current = self.is_vlm_reasoning_enabled()
+        self.enable_vlm_reasoning(not current)
+        return not current
 
     def init(self, high_level_skillset: SkillSet, low_level_skillset: SkillSet, vision_skill: VisionSkillWrapper):
         """Initialize skillsets and vision"""
@@ -571,10 +595,10 @@ Assessment:"""
 
             return f"Error in planning: {e}", "log('Planning failed')"
 
-    # ========== NEW: REPLAN ASSESSMENT ==========
+    # ========== REPLAN ASSESSMENT WITH REPLAN PROMPT ==========
     def assess_replan(self, original_task: str, past_reasoning: str, executed_commands: str,
-                      current_scene: str) -> Tuple[str, int, str]:
-        """Enhanced replan assessment using dedicated replan model"""
+                      current_scene: str) -> Tuple[str, int, str, str]:
+        """Enhanced replan assessment using dedicated replan model - NOW RETURNS REPLAN PROMPT"""
         print_t(f"[P] === REPLAN ASSESSMENT ===")
         print_t(f"[P] Original task: {original_task}")
         print_t(f"[P] Current scene: {current_scene}")
@@ -597,6 +621,7 @@ Assessment:"""
             decision = "CONTINUE"
             progress = 50
             feedback = response
+            replan_prompt = ""
 
             for line in lines:
                 if 'Decision:' in line:
@@ -608,13 +633,18 @@ Assessment:"""
                         pass
                 elif 'Feedback:' in line:
                     feedback = line.split(':', 1)[1].strip()
+                elif 'Replan Prompt:' in line:
+                    replan_prompt = line.split(':', 1)[1].strip()
 
             print_t(f"[P] Parsed assessment: {decision}, {progress}%, {feedback}")
-            return decision, progress, feedback
+            if replan_prompt:
+                print_t(f"[P] Replan prompt: {replan_prompt}")
+
+            return decision, progress, feedback, replan_prompt
 
         except Exception as e:
             print_t(f"[P] Error in replan assessment: {e}")
-            return "CONTINUE", 50, "Assessment failed, continuing"
+            return "CONTINUE", 50, "Assessment failed, continuing", ""
 
     # PROBE FUNCTIONALITY RESTORED
     def probe(self, question: str) -> Tuple[MiniSpecValueType, bool]:

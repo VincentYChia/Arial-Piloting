@@ -201,9 +201,31 @@ class LLMController():
         self.replan_controller.set_replan_model(model_name, temperature)
 
     def enable_vlm(self, enabled: bool = True):
-        """Enable or disable VLM usage"""
-        print_t(f"[C] VLM {'enabled' if enabled else 'disabled'}")
+        """Enable or disable VLM model (sets vlm_enabled only - for backwards compatibility)"""
+        print_t(f"[C] VLM model {'enabled' if enabled else 'disabled'}")
         self.planner.set_vlm_model(self.planner.vlm_model, enabled=enabled)
+
+    # ========== SIMPLE VLM REASONING ON/OFF TOGGLE ==========
+    def enable_vlm_reasoning(self, enabled: bool = True):
+        """
+        Simple on/off switch for VLM reasoning (MAIN METHOD TO USE)
+
+        Args:
+            enabled: True = use VLM when image available (with LLM fallback)
+                    False = always use LLM only
+        """
+        print_t(f"[C] VLM reasoning: {'ENABLING' if enabled else 'DISABLING'}")
+        self.planner.enable_vlm_reasoning(enabled)
+
+    def is_vlm_reasoning_enabled(self) -> bool:
+        """Check if VLM reasoning is currently enabled"""
+        return self.planner.is_vlm_reasoning_enabled()
+
+    def toggle_vlm_reasoning(self) -> bool:
+        """Toggle VLM reasoning on/off and return new state"""
+        new_state = self.planner.toggle_vlm_reasoning()
+        print_t(f"[C] VLM reasoning toggled: {'ON' if new_state else 'OFF'}")
+        return new_state
 
     # ========== SIMPLIFIED ENHANCED REPLAN CONTROLLER CONFIGURATION ==========
     def configure_safety_limits(self, max_iterations: int = None, max_time: float = None,
@@ -529,12 +551,32 @@ class LLMController():
         """
         Get the latest frame as a saved image file for VLM usage
         Returns the path to the saved image file
+
+        INTEGRATION NOTE: This method is critical for VLM functionality.
+        It saves the current frame to a temporary file that can be passed to the VLM.
+        Files are saved to self.cache_folder and should be cleaned up periodically.
         """
         try:
+            # Check for cancellation before processing
+            if self.cancellation_event.is_set():
+                print_t("[C] Frame capture cancelled")
+                return None
+
+            # Get image from shared frame
             image = self.shared_frame.get_image()
-            if image:
+            if image is not None:
+                # Generate unique filename
                 img_path = os.path.join(self.cache_folder, f"latest_frame_{uuid.uuid4()}.jpg")
-                image.save(img_path)
+
+                # Handle both PIL Image and numpy array formats
+                if hasattr(image, 'save'):
+                    # PIL Image
+                    image.save(img_path)
+                else:
+                    # numpy array - convert to PIL first
+                    pil_image = Image.fromarray(image)
+                    pil_image.save(img_path)
+
                 print_t(f"[C] Latest frame saved to: {img_path}")
                 return img_path
             else:
@@ -567,21 +609,36 @@ class LLMController():
                                           use_vlm: bool = None):
         """
         Execute task description using the simplified enhanced agentic pipeline
-        Now with only COMPLETE/CONTINUE decisions and manual stop capability
+        Now with simple VLM on/off toggle and consistent image provision
+
+        INTEGRATION NOTES:
+        - VLM gets fresh current frame on every planning iteration when enabled
+        - Provided image_path is used only on first iteration (if available)
+        - All subsequent iterations use get_latest_frame_path() for current visual context
+        - VLM receives same textual context as regular LLM plus visual information
+        - Simple toggle: VLM is either ON (with fallback) or OFF (LLM only)
 
         Args:
             task_description: Natural language task description
-            image_path: Optional path to image for VLM reasoning
-            use_vlm: Override VLM usage (None=auto, True=force, False=disable)
+            image_path: Optional path to image for VLM reasoning (used on first iteration only)
+            use_vlm: Override VLM usage (None=use global setting, True=force on, False=force off)
         """
         if self.controller_wait_takeoff:
             self.append_message("[Warning] Controller is waiting for takeoff...")
             return
 
+        # Determine VLM usage - SIMPLE LOGIC
+        if use_vlm is not None:
+            vlm_enabled_for_task = use_vlm
+            print_t(f"[C] VLM usage overridden: {'ON' if use_vlm else 'OFF'}")
+        else:
+            vlm_enabled_for_task = self.is_vlm_reasoning_enabled()
+            print_t(f"[C] VLM usage (global setting): {'ON' if vlm_enabled_for_task else 'OFF'}")
+
         print_t("[C] ========== SIMPLIFIED ENHANCED AGENTIC TASK EXECUTION START ==========")
         print_t(f"[C] Task: {task_description}")
         print_t(f"[C] Image provided: {image_path if image_path else 'None'}")
-        print_t(f"[C] VLM usage: {use_vlm if use_vlm is not None else 'Auto'}")
+        print_t(f"[C] VLM will be used: {vlm_enabled_for_task}")
         print_t(f"[C] Manual stop available at any time")
 
         self.append_message('[TASK]: ' + task_description)
@@ -594,10 +651,15 @@ class LLMController():
         self.pipeline_iterations = []
         self.replan_controller.start_new_task(task_description)
 
-        # Override VLM setting if specified
+        # Save current VLM state and set for this task - FIXED: Save both flags
         original_vlm_enabled = self.planner.vlm_enabled
+        original_use_vlm_for_reasoning = self.planner.use_vlm_for_reasoning
+
         if use_vlm is not None:
+            # Override both flags for this task
             self.planner.vlm_enabled = use_vlm
+            self.planner.use_vlm_for_reasoning = use_vlm
+            print_t(f"[C] VLM state overridden for this task: {use_vlm}")
 
         ret_val = None
         planning_iteration = 0
@@ -616,13 +678,31 @@ class LLMController():
 
                 try:
                     # Get dual-stage planner response with optional VLM
-                    print_t("[C] Calling dual-stage planner with VLM support...")
+                    print_t("[C] Calling dual-stage planner...")
                     execution_start_time = time.time()
 
+                    # Get current frame path for VLM if VLM is enabled
+                    current_image_path = None
+                    if vlm_enabled_for_task:
+                        if planning_iteration == 1 and image_path:
+                            # Use provided image on first iteration if available
+                            current_image_path = image_path
+                            print_t(f"[C] Using provided image for VLM: {image_path}")
+                        else:
+                            # Get current frame for all iterations when VLM is enabled
+                            current_image_path = self.get_latest_frame_path()
+                            if current_image_path:
+                                print_t(f"[C] Using current frame for VLM: {current_image_path}")
+                            else:
+                                print_t(f"[C] Warning: Could not get current frame for VLM")
+                    else:
+                        print_t(f"[C] VLM disabled - using LLM only")
+
+                    # Call planner (VLM will be used if enabled and image available)
                     plan_reason, minispec_code = self.planner.plan(
                         task_description,
                         execution_history=self.execution_history,
-                        image_path=image_path if planning_iteration == 1 else None  # Only use image on first iteration
+                        image_path=current_image_path
                     )
 
                     # Check for cancellation after planning
@@ -646,14 +726,16 @@ class LLMController():
                     print_t(f"[C] Reasoning: {plan_reason}")
                     print_t(f"[C] Generated code: {minispec_code}")
                     print_t(f"[C] Code length: {len(minispec_code)} characters")
+                    if current_image_path:
+                        print_t(f"[C] VLM used image: {current_image_path}")
 
-                    # Send messages to UI/queue - FIXED: Only send once here
+                    # Send messages to UI/queue - Only send once here
                     if plan_reason:
                         self.append_message(f'[Plan]: {plan_reason}')
                     else:
                         self.append_message(f'[Plan]: No reasoning provided')
 
-                    # FIXED: Only send the code once, not during interpreter parsing
+                    # Only send the code once, not during interpreter parsing
                     self.append_message(f'[Code]: {minispec_code}')
 
                     # Validate the generated code before execution
@@ -774,8 +856,13 @@ class LLMController():
                     break
 
         finally:
-            # Restore original VLM setting
-            self.planner.vlm_enabled = original_vlm_enabled
+            # INTEGRATION FIX: Restore both VLM flags if they were overridden
+            if use_vlm is not None:
+                self.planner.vlm_enabled = original_vlm_enabled
+                self.planner.use_vlm_for_reasoning = original_use_vlm_for_reasoning
+                print_t(
+                    f"[C] VLM state restored: vlm_enabled={original_vlm_enabled}, use_vlm_for_reasoning={original_use_vlm_for_reasoning}")
+
             # Clear auto-correction target
             self.auto_corrector.clear_target()
 
@@ -805,14 +892,18 @@ class LLMController():
     def execute_task_description(self, task_description: str):
         """
         Original method maintained for backward compatibility
-        Calls the new enhanced method without image
+        Calls the new enhanced method without image and uses global VLM setting
+
+        INTEGRATION NOTE: This maintains existing behavior for code that doesn't use VLM
         """
-        return self.execute_task_description_with_vlm(task_description, image_path=None, use_vlm=False)
+        return self.execute_task_description_with_vlm(task_description, image_path=None, use_vlm=None)
 
     def execute_task_with_image(self, task_description: str, image_path: str):
         """
         Convenience method for executing tasks with image input
         Automatically enables VLM for this execution
+
+        INTEGRATION NOTE: This is a clean way to use VLM with a specific image
         """
         return self.execute_task_description_with_vlm(task_description, image_path=image_path, use_vlm=True)
 
@@ -837,23 +928,70 @@ class LLMController():
 
     def capture_loop(self, asyncio_loop):
         print_t("[C] Start capture loop...")
-        frame_reader = self.drone.get_frame_reader()
-        while self.controller_active:
-            self.drone.keep_active()
-            self.latest_frame = frame_reader.frame
-            frame = Frame(frame_reader.frame,
-                          frame_reader.depth if hasattr(frame_reader, 'depth') else None)
 
-            if self.yolo_client.is_local_service():
-                self.yolo_client.detect_local(frame)
-            else:
-                # asynchronously send image to yolo server
-                asyncio_loop.call_soon_threadsafe(asyncio.create_task, self.yolo_client.detect(frame))
+        # Wait for stream to be ready with timeout
+        max_wait_time = 10  # seconds
+        wait_start = time.time()
+        frame_reader = None
+
+        while frame_reader is None and (time.time() - wait_start) < max_wait_time:
+            frame_reader = self.drone.get_frame_reader()
+            if frame_reader is None:
+                print_t("[C] Waiting for video stream to start...")
+                time.sleep(0.5)
+
+        if frame_reader is None:
+            print_t("[C] ERROR: Could not get frame reader - video stream failed to start")
+            return
+
+        print_t("[C] Video stream ready, starting capture loop")
+
+        while self.controller_active:
+            try:
+                self.drone.keep_active()
+
+                # Get current frame with error handling
+                if frame_reader and hasattr(frame_reader, 'frame'):
+                    current_frame = frame_reader.frame
+                    if current_frame is not None:
+                        self.latest_frame = current_frame
+
+                        frame = Frame(current_frame,
+                                      frame_reader.depth if hasattr(frame_reader, 'depth') else None)
+
+                        if self.yolo_client.is_local_service():
+                            self.yolo_client.detect_local(frame)
+                        else:
+                            # asynchronously send image to yolo server
+                            asyncio_loop.call_soon_threadsafe(asyncio.create_task, self.yolo_client.detect(frame))
+                    else:
+                        print_t("[C] Warning: Received None frame from stream")
+                else:
+                    print_t("[C] Warning: Frame reader lost, attempting to reconnect...")
+                    frame_reader = self.drone.get_frame_reader()
+
+            except Exception as e:
+                print_t(f"[C] Error in capture loop: {e}")
+                # Try to recover by getting a new frame reader
+                try:
+                    frame_reader = self.drone.get_frame_reader()
+                except:
+                    print_t("[C] Could not recover frame reader")
+
             time.sleep(0.10)
+
+        print_t("[C] Capture loop stopping...")
+
         # Cancel all running tasks (if any)
         for task in asyncio.all_tasks(asyncio_loop):
             task.cancel()
-        self.drone.stop_stream()
-        self.drone.land()
+
+        # Clean shutdown
+        try:
+            self.drone.stop_stream()
+            self.drone.land()
+        except Exception as e:
+            print_t(f"[C] Error during capture loop cleanup: {e}")
+
         asyncio_loop.stop()
         print_t("[C] Capture loop stopped")
