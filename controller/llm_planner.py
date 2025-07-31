@@ -4,7 +4,6 @@ from datetime import datetime
 import os, ast
 from typing import Optional, Tuple
 import time
-
 from .skillset import SkillSet
 from .llm_wrapper import LLMWrapper, GPT3, GPT4, TINY_LLAMA
 from .vision_skill_wrapper import VisionSkillWrapper
@@ -46,7 +45,7 @@ class SimpleCsvLogger:
                 'timestamp', 'date', 'time_of_day', 'user_input',
                 'model1_reasoning', 'model2_minispec', 'drone_result',
                 'errors', 'execution_time_sec', 'reasoning_model', 'minispec_model',
-                'reasoning_temperature', 'minispec_temperature'
+                'reasoning_temperature', 'minispec_temperature', 'combined_mode'
             ])
 
     def _get_windows_downloads_path(self):
@@ -122,7 +121,7 @@ class SimpleCsvLogger:
     def log(self, user_input, model1_reasoning, model2_minispec,
             execution_time, reasoning_model, minispec_model,
             reasoning_temperature, minispec_temperature,
-            drone_result="", errors=""):
+            drone_result="", errors="", combined_mode=False):
 
         now = datetime.now()
         with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
@@ -140,44 +139,68 @@ class SimpleCsvLogger:
                 reasoning_model,
                 minispec_model,
                 reasoning_temperature,
-                minispec_temperature
+                minispec_temperature,
+                combined_mode
             ])
 
 
 class LLMPlanner():
     def __init__(self, robot_type: RobotType):
-        print_t("[P] Initializing enhanced dual-model LLM planner with VLM reasoning replacement capability...")
+        print_t(
+            "[P] Initializing enhanced dual-model LLM planner with modular VLM, combined model capability, classifier model support, and independent VLM probe support...")
 
         # MODEL CONFIGURATION (EASILY MODIFIABLE)
         # Core models
-        self.reasoning_model = "qwen3-4b-reasoning_1"
-        self.minispec_model = "qwen3-4b-writing_13"
+        self.reasoning_model = "qwen3-4b-reasoning_5"
+        self.minispec_model = "qwen3-1.7b-writing_13"
 
         # NEW: Enhanced models for VLM and replan assessment
         self.vlm_model = "qwen2.5vl"
         self.replan_model = "qwen3:1.7b"
 
-        # Temperature settings for each model
-        self.reasoning_temperature = 0.3  # Slightly higher for reasoning creativity
-        self.minispec_temperature = 0.0  # Very low for precise code generation
-        self.vlm_temperature = 0.3  # NEW: VLM temperature
-        self.replan_temperature = 0.2  # NEW: Replan temperature
+        # NEW: Combined model configuration
+        self.combined_model = "qwen3-8b-combined_2"
+        self.use_combined_model = False  # Default to dual-model approach
 
-        # NEW: VLM configuration
+        # NEW: Probe model configuration (unfintuned model)
+        self.probe_model = "qwen3:1.7b"
+
+        # NEW: Classifier model configuration (for YOLO + LLM classification)
+        self.classifier_model = "qwen3:0.6b"
+
+        # Temperature settings for each model
+        self.reasoning_temperature = 0.25  # Slightly higher for reasoning creativity
+        self.minispec_temperature = 0.05  # Very low for precise code generation
+        self.vlm_temperature = 0.3  # NEW: VLM temperature
+        self.replan_temperature = 0.3  # NEW: Replan temperature
+        self.combined_temperature = 0.1  # NEW: Combined model temperature
+        self.probe_temperature = 0.1  # NEW: Probe model temperature
+        self.classifier_temperature = 0.25  # NEW: Classifier model temperature
+
+        # NEW: VLM configuration - MODULAR FLAGS
         self.vlm_enabled = True
-        self.use_vlm_for_reasoning = False  # NEW: Flag to use VLM as reasoning replacement
+        self.use_vlm_for_reasoning = False  # VLM for reasoning stage (dual-model approach)
+        self.use_vlm_for_probe = True  # VLM for probe functionality (independent)
 
         print_t(f"[P] Reasoning model: {self.reasoning_model} (temp: {self.reasoning_temperature})")
         print_t(f"[P] MiniSpec model: {self.minispec_model} (temp: {self.minispec_temperature})")
         print_t(f"[P] VLM model: {self.vlm_model} (temp: {self.vlm_temperature}, enabled: {self.vlm_enabled})")
-        print_t(f"[P] VLM reasoning mode: {self.use_vlm_for_reasoning}")
+        print_t(f"[P] VLM for reasoning: {self.use_vlm_for_reasoning}")
+        print_t(f"[P] VLM for probe: {self.use_vlm_for_probe}")
         print_t(f"[P] Replan model: {self.replan_model} (temp: {self.replan_temperature})")
+        print_t(
+            f"[P] Combined model: {self.combined_model} (temp: {self.combined_temperature}, enabled: {self.use_combined_model})")
+        print_t(f"[P] Probe model: {self.probe_model} (temp: {self.probe_temperature})")
+        print_t(f"[P] Classifier model: {self.classifier_model} (temp: {self.classifier_temperature})")
 
         # Initialize LLM instances
         self.reasoning_llm = LLMWrapper(temperature=self.reasoning_temperature)
         self.minispec_llm = LLMWrapper(temperature=self.minispec_temperature)
         self.vlm_llm = LLMWrapper(temperature=self.vlm_temperature)  # NEW: VLM instance
         self.replan_llm = LLMWrapper(temperature=self.replan_temperature)  # NEW: Replan instance
+        self.combined_llm = LLMWrapper(temperature=self.combined_temperature)  # NEW: Combined instance
+        self.probe_llm = LLMWrapper(temperature=self.probe_temperature)  # NEW: Probe instance
+        self.classifier_llm = LLMWrapper(temperature=self.classifier_temperature)  # NEW: Classifier instance
 
         self.robot_type = robot_type
         type_folder_name = 'tello'
@@ -192,7 +215,8 @@ class LLMPlanner():
         # Initialize inline prompts
         self._init_prompts()
 
-        print_t("[P] Enhanced dual-model planner with VLM reasoning replacement capability initialized successfully")
+        print_t(
+            "[P] Enhanced dual-model planner with modular VLM, combined model capability, classifier model support, and independent VLM probe support initialized successfully")
 
     def _init_prompts(self):
         """Initialize all prompts as inline strings matching fine-tuning format"""
@@ -200,8 +224,7 @@ class LLMPlanner():
 
         # STAGE 1: REASONING PROMPT - MATCHING FINE-TUNING FORMAT
         # This prompt will be used for both reasoning model and VLM reasoning
-        self.reasoning_prompt = """/no_think
-You are a robot pilot reasoning system. Analyze the given scene and task to provide a concise reasoning sentence about what actions should be taken.
+        self.reasoning_prompt = """You are a robot pilot reasoning system. Analyze the given scene and task to provide a concise reasoning sentence about what actions should be taken.
 ## Available Skills
 High-level skills:
 s (scan): Rotate to find object when not in current scene
@@ -223,6 +246,7 @@ Analyze the scene and task, then provide detailed reasoning about:
 3. What approach should be taken
 4. What skills or sequence of actions would be most appropriate
 5. Adding re_plan will allow for persistent tasks such as following or if/then conditional tasks to proceed smoother
+6. Use scan abstract when scanning for abstract objects such as food or toys
 ## Current Input
 **Scene:** {scene_description}
 **Task:** {task_description}
@@ -230,7 +254,7 @@ Analyze the scene and task, then provide detailed reasoning about:
 Provide your reasoning:"""
 
         # STAGE 2: MINISPEC WRITER PROMPT - MATCHING FINE-TUNING FORMAT
-        self.minispec_prompt = """/no_think
+        self.minispec_prompt = """
 You are a MiniSpec code generator. Given reasoning about a robot task, generate the appropriate MiniSpec program to execute the plan.
 Available Skills
 High-level skills:
@@ -255,6 +279,37 @@ Reasoning Input
 
 Generate the Minispec Program:
 """
+
+        # NEW: COMBINED MODEL PROMPT
+        self.combined_prompt = """/no_think
+You are a robot pilot. Generate a MiniSpec plan to fulfill the task or ask for clarification if the input is unclear.
+## System Skills
+High-level skills:
+s (scan): Rotate to find object when not in current scene
+sa (scan_abstract): Rotate to find abstract object by description when not in current scene
+Low-level skills:
+Movement: mf (move_forward), mb (move_backward), ml (move_left), mr (move_right), mu (move_up), md (move_down)
+Rotation: tc (turn_cw), tu (turn_ccw)
+Utilities: d (delay), tp (take_picture), rp (re_plan), t (time)
+Vision: iv (is_visible), ox (object_x), oy (object_y), ow (object_width), oh (object_height), od (object_dis)
+Logic: p (probe), l (log), g (goto)
+Use high-level skills when available. Invoke skills using their short names. If a skill has no arguments, call it without parentheses.
+## Input Format
+- **Scene description:** Objects in current view with IDs, locations, and sizes (coordinates 0-1)
+- **Task description:** Natural language instructions starting with "[A]" (action) or "[Q]" (question)
+- **Execution history:** Previous actions taken (provided during replanning)
+## Key Rules
+1. Follow task description exactly - read word by word
+2. Preserve directions mentioned in task (forward stays forward, left stays left)
+3. Only use scene objects if task specifically asks for them
+4. For "[A]" tasks: generate execution plan
+5. For "[Q]" tasks: use 'log' to output the answer
+6. During replanning: consider execution history and current scene
+## Current Input
+**Scene:** {scene_description}  
+**Task:** {task_description}  
+**Execution History:** {execution_history}
+Generate response as a single MiniSpec program sentence."""
 
         # PROBE PROMPT - RESTORED
         self.probe_prompt = """/no_think
@@ -297,7 +352,7 @@ Question:{question}
 Please give the content of results only, don't include 'Output:' in the results."""
 
         # UPDATED: REPLAN ASSESSMENT PROMPT WITH REPLAN PROMPT FIELD
-        self.replan_assessment_prompt = """Assess the current state of a robot task execution and determine next steps.
+        self.replan_assessment_prompt = """Assess the current state of a robot task execution and determine next steps. Your goal is to aid the system in completing the orignal task thorugh judging task completion and providing valuable guidance.
 
 Original Task: {original_task}
 Past Reasoning: {past_reasoning}
@@ -311,10 +366,10 @@ Analyze the situation and provide:
 General Guidelines:
 1. If previous task involves scanning and no object found, suggest using scan abstract
 2. If original command was to follow an object, decide if complete or an additional move prompt is necessary
+3. If the original command has conditionals that were fulfilled replan for just the unfinished actions 
 
 Provide assessment in this format:
 Decision: COMPLETE/REPLAN/CONTINUE
-Feedback: [Brief explanation and guidance]
 Replan Prompt: [If replan, write a new task to help achieve the original task]
 """
 
@@ -361,28 +416,109 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
             self.replan_llm = LLMWrapper(temperature=temperature)
         print_t(f"[P] Replan model updated: {model_name} (temp: {self.replan_temperature})")
 
-    # ========== SIMPLE VLM REASONING ON/OFF TOGGLE ==========
+    def set_probe_model(self, model_name: str, temperature: float = None):
+        """Set the probe model (unfintuned model for scene questioning)"""
+        self.probe_model = model_name
+        if temperature is not None:
+            self.probe_temperature = temperature
+            self.probe_llm = LLMWrapper(temperature=temperature)
+        print_t(f"[P] Probe model updated: {model_name} (temp: {self.probe_temperature})")
+
+    def set_classifier_model(self, model_name: str, temperature: float = None):
+        """Set the classifier model for YOLO + LLM classification"""
+        self.classifier_model = model_name
+        if temperature is not None:
+            self.classifier_temperature = temperature
+            self.classifier_llm = LLMWrapper(temperature=temperature)
+        print_t(f"[P] Classifier model updated: {model_name} (temp: {self.classifier_temperature})")
+
+    # ========== NEW: COMBINED MODEL CONFIGURATION METHODS ==========
+    def set_combined_model(self, model_name: str, temperature: float = None):
+        """Set the combined model and temperature"""
+        self.combined_model = model_name
+        if temperature is not None:
+            self.combined_temperature = temperature
+            self.combined_llm = LLMWrapper(temperature=temperature)
+        print_t(f"[P] Combined model updated: {model_name} (temp: {self.combined_temperature})")
+
+    def enable_combined_mode(self, enabled: bool = True):
+        """Enable or disable combined model mode"""
+        self.use_combined_model = enabled
+        print_t(f"[P] Combined model mode: {'ENABLED' if enabled else 'DISABLED'}")
+        print_t(f"[P] Planning approach: {'Single combined model' if enabled else 'Dual-model (reasoning + writing)'}")
+
+    def disable_combined_mode(self):
+        """Disable combined model mode (use dual-model approach)"""
+        self.enable_combined_mode(False)
+
+    def is_combined_mode_enabled(self) -> bool:
+        """Check if combined model mode is currently enabled"""
+        return self.use_combined_model
+
+    def toggle_combined_mode(self) -> bool:
+        """Toggle combined model mode on/off and return new state"""
+        new_state = not self.use_combined_model
+        self.enable_combined_mode(new_state)
+        return new_state
+
+    # ========== MODULAR VLM CONFIGURATION METHODS ==========
     def enable_vlm_reasoning(self, enabled: bool = True):
         """
-        Simple on/off switch for VLM reasoning (MAIN METHOD TO USE)
+        Enable/disable VLM for reasoning stage (dual-model approach only)
 
         Args:
             enabled: True = use VLM when image available (with LLM fallback)
-                    False = always use LLM only
+                    False = always use LLM only for reasoning
         """
         self.use_vlm_for_reasoning = enabled
-        self.vlm_enabled = enabled  # FIXED: Also set vlm_enabled flag
-        print_t(f"[P] VLM reasoning: {'ENABLED' if enabled else 'DISABLED'}")
+        self.vlm_enabled = enabled or self.use_vlm_for_probe  # Keep VLM enabled if probe needs it
+        print_t(f"[P] VLM for reasoning: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def enable_vlm_probe(self, enabled: bool = True):
+        """
+        Enable/disable VLM for probe functionality (independent of reasoning)
+
+        Args:
+            enabled: True = use VLM for probe when image available (with fallback)
+                    False = always use unfintuned model for probe
+        """
+        self.use_vlm_for_probe = enabled
+        self.vlm_enabled = enabled or self.use_vlm_for_reasoning  # Keep VLM enabled if reasoning needs it
+        print_t(f"[P] VLM for probe: {'ENABLED' if enabled else 'DISABLED'}")
 
     def is_vlm_reasoning_enabled(self) -> bool:
-        """Check if VLM reasoning is currently enabled (NEW METHOD)"""
+        """Check if VLM reasoning is currently enabled"""
         return self.use_vlm_for_reasoning and self.vlm_enabled
 
+    def is_vlm_probe_enabled(self) -> bool:
+        """Check if VLM probe is currently enabled"""
+        return self.use_vlm_for_probe and self.vlm_enabled
+
     def toggle_vlm_reasoning(self) -> bool:
-        """Toggle VLM reasoning on/off and return new state (NEW METHOD)"""
+        """Toggle VLM reasoning on/off and return new state"""
         current = self.is_vlm_reasoning_enabled()
         self.enable_vlm_reasoning(not current)
         return not current
+
+    def toggle_vlm_probe(self) -> bool:
+        """Toggle VLM probe on/off and return new state"""
+        current = self.is_vlm_probe_enabled()
+        self.enable_vlm_probe(not current)
+        return not current
+
+    def disable_vlm_all(self):
+        """Disable VLM for both reasoning and probe"""
+        self.use_vlm_for_reasoning = False
+        self.use_vlm_for_probe = False
+        self.vlm_enabled = False
+        print_t("[P] VLM disabled for both reasoning and probe")
+
+    def enable_vlm_all(self):
+        """Enable VLM for both reasoning and probe"""
+        self.use_vlm_for_reasoning = True
+        self.use_vlm_for_probe = True
+        self.vlm_enabled = True
+        print_t("[P] VLM enabled for both reasoning and probe")
 
     def init(self, high_level_skillset: SkillSet, low_level_skillset: SkillSet, vision_skill: VisionSkillWrapper):
         """Initialize skillsets and vision"""
@@ -391,6 +527,63 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
         self.low_level_skillset = low_level_skillset
         self.vision_skill = vision_skill
         print_t("[P] Skillsets and vision initialized")
+
+    # ========== NEW: COMBINED MODEL PLANNING METHOD ==========
+    def plan_combined(self, task_description: str, scene_description: str,
+                      execution_history: Optional[str] = None) -> str:
+        """
+        Single-model planning approach - generates MiniSpec directly from task/scene/history
+
+        Args:
+            task_description: Natural language task description
+            scene_description: Current scene objects
+            execution_history: Previous execution history (optional)
+
+        Returns:
+            str: MiniSpec code
+        """
+        print_t("[P] ====== COMBINED MODEL PLANNING ======")
+        print_t(f"[P] Task: {task_description}")
+        print_t(f"[P] Scene: {scene_description}")
+        print_t(f"[P] History: {execution_history}")
+
+        start_time = time.time()
+
+        # Format the combined prompt
+        prompt = self.combined_prompt.format(
+            scene_description=scene_description,
+            task_description=task_description,
+            execution_history=execution_history or "None"
+        )
+
+        print_t(f"[P] Sending combined request to model: {self.combined_model}")
+        print_t(f"[P] Combined prompt length: {len(prompt)} characters")
+        print_t(f"[P] Combined prompt preview: {prompt[:200]}...")
+
+        try:
+            # Make the LLM call
+            response = self.combined_llm.request(prompt, self.combined_model, stream=False)
+
+            combined_time = time.time() - start_time
+            print_t(f"[P] Combined planning completed in {combined_time:.2f}s")
+            print_t(f"[P] Raw combined response: {response}")
+
+            # Extract code (remove any prefixes if present)
+            if response.startswith("Response:"):
+                code = response[9:].strip()
+            else:
+                code = response.strip()
+
+            # Remove trailing semicolon if present
+            if code.endswith(';'):
+                code = code[:-1]
+
+            print_t(f"[P] Extracted combined MiniSpec code: {code}")
+            return code
+
+        except Exception as e:
+            print_t(f"[P] Error in combined planning: {e}")
+            raise e
 
     def plan_reasoning(self, task_description: str, scene_description: str,
                        execution_history: Optional[str] = None, image_path: Optional[str] = None,
@@ -515,7 +708,7 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
              execution_history: Optional[str] = None, image_path: Optional[str] = None,
              use_vlm_for_reasoning: bool = None) -> Tuple[str, str]:
         """
-        Enhanced main planning method with VLM reasoning replacement capability
+        Enhanced main planning method with combined model OR dual-model capability
 
         Args:
             task_description: Natural language task description
@@ -528,7 +721,7 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
         Returns:
             Tuple[str, str]: (reasoning, minispec_code)
         """
-        print_t("[P] ========== ENHANCED DUAL-STAGE PLANNING START ==========")
+        print_t("[P] ========== ENHANCED PLANNING START ==========")
         total_start_time = time.time()
 
         # Prepare task description
@@ -542,42 +735,78 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
             print_t(f"[P] Retrieved scene description: {scene_description}")
 
         try:
-            # Stage 1: Generate reasoning (using either reasoning model or VLM)
-            reasoning, actual_reasoning_model = self.plan_reasoning(
-                task_description, scene_description, execution_history, image_path, use_vlm_for_reasoning
-            )
+            # NEW: Route to combined model OR dual-model approach
+            if self.use_combined_model:
+                print_t("[P] ========== USING COMBINED MODEL APPROACH ==========")
 
-            # Stage 2: Generate MiniSpec code (gets ONLY reasoning)
-            code = self.plan_minispec(reasoning)
+                # Single model does both reasoning and code generation
+                code = self.plan_combined(task_description, scene_description, execution_history)
 
-            total_time = time.time() - total_start_time
-            print_t(f"[P] ========== ENHANCED DUAL-STAGE PLANNING COMPLETE in {total_time:.2f}s ==========")
-            print_t(f"[P] Final reasoning: {reasoning}")
-            print_t(f"[P] Final MiniSpec code: {code}")
-            print_t(f"[P] Actual reasoning model used: {actual_reasoning_model}")
+                # For logging purposes, set reasoning to a descriptive message
+                reasoning = f"Combined model approach - direct code generation from task"
+                actual_model_used = self.combined_model
 
-            # Log successful operation with actual model used
-            actual_reasoning_temperature = (
-                self.vlm_temperature if actual_reasoning_model == self.vlm_model
-                else self.reasoning_temperature
-            )
+                total_time = time.time() - total_start_time
+                print_t(f"[P] ========== COMBINED MODEL PLANNING COMPLETE in {total_time:.2f}s ==========")
+                print_t(f"[P] Generated MiniSpec code: {code}")
+                print_t(f"[P] Model used: {actual_model_used}")
 
-            self.csv_logger.log(
-                user_input=task_description,
-                model1_reasoning=reasoning,
-                model2_minispec=code,
-                execution_time=total_time,
-                reasoning_model=actual_reasoning_model,
-                minispec_model=self.minispec_model,
-                reasoning_temperature=actual_reasoning_temperature,
-                minispec_temperature=self.minispec_temperature,
-                errors=error_message or ""
-            )
+                # Log successful operation
+                self.csv_logger.log(
+                    user_input=task_description,
+                    model1_reasoning=reasoning,
+                    model2_minispec=code,
+                    execution_time=total_time,
+                    reasoning_model=actual_model_used,
+                    minispec_model="N/A (Combined)",
+                    reasoning_temperature=self.combined_temperature,
+                    minispec_temperature=0,
+                    errors=error_message or "",
+                    combined_mode=True
+                )
 
-            return reasoning, code
+                return reasoning, code
+
+            else:
+                print_t("[P] ========== USING DUAL-MODEL APPROACH ==========")
+
+                # Stage 1: Generate reasoning (using either reasoning model or VLM)
+                reasoning, actual_reasoning_model = self.plan_reasoning(
+                    task_description, scene_description, execution_history, image_path, use_vlm_for_reasoning
+                )
+
+                # Stage 2: Generate MiniSpec code (gets ONLY reasoning)
+                code = self.plan_minispec(reasoning)
+
+                total_time = time.time() - total_start_time
+                print_t(f"[P] ========== DUAL-MODEL PLANNING COMPLETE in {total_time:.2f}s ==========")
+                print_t(f"[P] Final reasoning: {reasoning}")
+                print_t(f"[P] Final MiniSpec code: {code}")
+                print_t(f"[P] Actual reasoning model used: {actual_reasoning_model}")
+
+                # Log successful operation with actual model used
+                actual_reasoning_temperature = (
+                    self.vlm_temperature if actual_reasoning_model == self.vlm_model
+                    else self.reasoning_temperature
+                )
+
+                self.csv_logger.log(
+                    user_input=task_description,
+                    model1_reasoning=reasoning,
+                    model2_minispec=code,
+                    execution_time=total_time,
+                    reasoning_model=actual_reasoning_model,
+                    minispec_model=self.minispec_model,
+                    reasoning_temperature=actual_reasoning_temperature,
+                    minispec_temperature=self.minispec_temperature,
+                    errors=error_message or "",
+                    combined_mode=False
+                )
+
+                return reasoning, code
 
         except Exception as e:
-            print_t(f"[P] ERROR in enhanced dual-stage planning: {e}")
+            print_t(f"[P] ERROR in enhanced planning: {e}")
             print_t(f"[P] Returning fallback response")
 
             # Log failed operation
@@ -586,19 +815,20 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
                 model1_reasoning=f"ERROR: {e}",
                 model2_minispec="log('Planning failed')",
                 execution_time=time.time() - total_start_time,
-                reasoning_model=self.reasoning_model,
-                minispec_model=self.minispec_model,
-                reasoning_temperature=self.reasoning_temperature,
-                minispec_temperature=self.minispec_temperature,
-                errors=str(e)
+                reasoning_model=self.combined_model if self.use_combined_model else self.reasoning_model,
+                minispec_model="N/A (Combined)" if self.use_combined_model else self.minispec_model,
+                reasoning_temperature=self.combined_temperature if self.use_combined_model else self.reasoning_temperature,
+                minispec_temperature=0 if self.use_combined_model else self.minispec_temperature,
+                errors=str(e),
+                combined_mode=self.use_combined_model
             )
 
             return f"Error in planning: {e}", "log('Planning failed')"
 
-    # ========== REPLAN ASSESSMENT WITH REPLAN PROMPT ==========
+    # ========== REPLAN ASSESSMENT WITH NATURAL LANGUAGE RESTART ==========
     def assess_replan(self, original_task: str, past_reasoning: str, executed_commands: str,
                       current_scene: str) -> Tuple[str, int, str, str]:
-        """Enhanced replan assessment using dedicated replan model - NOW RETURNS REPLAN PROMPT"""
+        """Enhanced replan assessment - generates new natural language task for restart"""
         print_t(f"[P] === REPLAN ASSESSMENT ===")
         print_t(f"[P] Original task: {original_task}")
         print_t(f"[P] Current scene: {current_scene}")
@@ -638,7 +868,7 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
 
             print_t(f"[P] Parsed assessment: {decision}, {progress}%, {feedback}")
             if replan_prompt:
-                print_t(f"[P] Replan prompt: {replan_prompt}")
+                print_t(f"[P] New task for restart: {replan_prompt}")
 
             return decision, progress, feedback, replan_prompt
 
@@ -646,20 +876,66 @@ Replan Prompt: [If replan, write a new task to help achieve the original task]
             print_t(f"[P] Error in replan assessment: {e}")
             return "CONTINUE", 50, "Assessment failed, continuing", ""
 
-    # PROBE FUNCTIONALITY RESTORED
+    # PROBE FUNCTIONALITY WITH MODULAR VLM SUPPORT
     def probe(self, question: str) -> Tuple[MiniSpecValueType, bool]:
-        """Probe method for scene questioning using reasoning model"""
+        """Probe method for scene questioning using VLM (if enabled for probe) or unfintuned fallback model"""
         print_t(f"[P] === PROBE REQUEST ===")
         print_t(f"[P] Question: {question}")
 
+        # Get current image for VLM probe if VLM probe is enabled
+        current_image_path = None
+        should_use_vlm = self.vlm_enabled and self.use_vlm_for_probe  # Use separate probe flag
+
+        if should_use_vlm:
+            # Try to get current frame - this needs to be called from controller context
+            try:
+                # This will be set by the controller when it calls probe
+                if hasattr(self, '_current_image_path') and self._current_image_path:
+                    current_image_path = self._current_image_path
+                    print_t(f"[P] Using current image for VLM probe: {current_image_path}")
+                else:
+                    print_t(f"[P] No current image available, falling back to unfintuned model")
+                    should_use_vlm = False
+            except Exception as e:
+                print_t(f"[P] Error getting image for VLM probe: {e}, falling back to unfintuned model")
+                should_use_vlm = False
+
+        # Format probe prompt
         prompt = self.probe_prompt.format(
             scene_description=self.vision_skill.get_obj_list(),
             question=question
         )
 
-        print_t(f"[P] Sending probe to reasoning model: {self.reasoning_model}")
         print_t(f"[P] Probe prompt length: {len(prompt)} characters")
-        response = self.reasoning_llm.request(prompt, self.reasoning_model)
 
-        print_t(f"[P] Probe response: {response}")
-        return evaluate_value(response), False
+        try:
+            if should_use_vlm and current_image_path:
+                print_t(f"[P] Sending probe to VLM model: {self.vlm_model}")
+                response = self.vlm_llm.request(
+                    prompt=prompt,
+                    model_name=self.vlm_model,
+                    image_path=current_image_path,
+                    stream=False
+                )
+                print_t(f"[P] VLM probe response: {response}")
+            else:
+                print_t(f"[P] Sending probe to unfintuned probe model: {self.probe_model}")
+                response = self.probe_llm.request(prompt, self.probe_model)
+                print_t(f"[P] Unfintuned probe response: {response}")
+
+            return evaluate_value(response), False
+
+        except Exception as e:
+            print_t(f"[P] Error in probe request: {e}")
+            # Fallback to unfintuned model if VLM fails
+            if should_use_vlm:
+                print_t(f"[P] VLM probe failed, falling back to unfintuned model: {self.probe_model}")
+                try:
+                    response = self.probe_llm.request(prompt, self.probe_model)
+                    print_t(f"[P] Fallback probe response: {response}")
+                    return evaluate_value(response), False
+                except Exception as fallback_e:
+                    print_t(f"[P] Fallback probe also failed: {fallback_e}")
+                    return evaluate_value("False"), False
+            else:
+                return evaluate_value("False"), False

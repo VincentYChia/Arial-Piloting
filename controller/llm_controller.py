@@ -6,7 +6,6 @@ import uuid
 from enum import Enum
 import re
 from threading import Event
-
 from .shared_frame import SharedFrame, Frame
 from .yolo_client import YoloClient
 from .yolo_grpc_client import YoloGRPCClient
@@ -30,7 +29,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 class LLMController():
     def __init__(self, robot_type, use_http=False, message_queue: Optional[queue.Queue] = None):
         print_t(
-            "[C] Initializing LLMController with dual-model, VLM, YoloE, auto-correction, simplified enhanced replan controller, and probe support...")
+            "[C] Initializing LLMController with dual-model, modular VLM, YoloE, YOLO+LLM classification, auto-correction, simplified enhanced replan controller, probe support, and combined model capability...")
 
         self.shared_frame = SharedFrame()
         if use_http:
@@ -126,14 +125,20 @@ class LLMController():
             LowLevelSkillItem("object_dis", self.vision.object_distance, "Get object's distance in cm",
                               args=[SkillArg("object_name", str)]))
 
-        # ========== PROBE FUNCTIONALITY RESTORED ==========
+        # ========== PROBE FUNCTIONALITY WITH VLM SUPPORT ==========
         self.low_level_skillset.add_skill(
-            LowLevelSkillItem("probe", self.planner.probe, "Probe the LLM for reasoning",
+            LowLevelSkillItem("probe", self.skill_probe, "Probe the LLM for reasoning with VLM support",
                               args=[SkillArg("question", str)]))
 
         # ========== YOLOE FUNCTIONALITY ==========
         self.low_level_skillset.add_skill(
             LowLevelSkillItem("ye", self.skill_yoloe_detect, "YoloE visual prompt detection",
+                              args=[SkillArg("description", str)]))
+
+        # ========== NEW: YOLO + LLM CLASSIFICATION FUNCTIONALITY ==========
+        self.low_level_skillset.add_skill(
+            LowLevelSkillItem("yolo_classify", self.skill_yolo_classify,
+                              "YOLO + LLM object classification with position",
                               args=[SkillArg("description", str)]))
 
         self.low_level_skillset.add_skill(
@@ -176,7 +181,7 @@ class LLMController():
         self.pipeline_iterations = []
 
         print_t(
-            "[C] LLMController with dual-model, VLM, YoloE, auto-correction, simplified enhanced replan controller, and probe support initialization complete")
+            "[C] LLMController with dual-model, modular VLM, YoloE, YOLO+LLM classification, auto-correction, simplified enhanced replan controller, probe support, and combined model capability initialization complete")
 
     # ========== MODEL CONFIGURATION METHODS ==========
     def set_reasoning_model(self, model_name: str, temperature: float = None):
@@ -200,32 +205,99 @@ class LLMController():
         self.planner.set_replan_model(model_name, temperature)
         self.replan_controller.set_replan_model(model_name, temperature)
 
+    def set_probe_model(self, model_name: str, temperature: float = None):
+        """Configure the probe model (unfintuned model for scene questioning)"""
+        print_t(f"[C] Setting probe model to: {model_name}")
+        self.planner.set_probe_model(model_name, temperature)
+
+    def set_classifier_model(self, model_name: str, temperature: float = None):
+        """Configure the YOLO+LLM classifier model"""
+        print_t(f"[C] Setting classifier model to: {model_name}")
+        self.planner.set_classifier_model(model_name, temperature)
+
+    # ========== NEW: COMBINED MODEL CONFIGURATION METHODS ==========
+    def set_combined_model(self, model_name: str, temperature: float = None):
+        """Configure the combined model"""
+        print_t(f"[C] Setting combined model to: {model_name}")
+        self.planner.set_combined_model(model_name, temperature)
+
+    def enable_combined_mode(self, enabled: bool = True):
+        """Enable or disable combined model mode"""
+        print_t(f"[C] Combined model mode: {'ENABLING' if enabled else 'DISABLING'}")
+        self.planner.enable_combined_mode(enabled)
+
+    def disable_combined_mode(self):
+        """Disable combined model mode (use dual-model approach)"""
+        print_t(f"[C] Combined model mode: DISABLING")
+        self.planner.disable_combined_mode()
+
+    def is_combined_mode_enabled(self) -> bool:
+        """Check if combined model mode is currently enabled"""
+        return self.planner.is_combined_mode_enabled()
+
+    def toggle_combined_mode(self) -> bool:
+        """Toggle combined model mode on/off and return new state"""
+        new_state = self.planner.toggle_combined_mode()
+        print_t(f"[C] Combined model mode toggled: {'ON' if new_state else 'OFF'}")
+        return new_state
+
     def enable_vlm(self, enabled: bool = True):
         """Enable or disable VLM model (sets vlm_enabled only - for backwards compatibility)"""
         print_t(f"[C] VLM model {'enabled' if enabled else 'disabled'}")
         self.planner.set_vlm_model(self.planner.vlm_model, enabled=enabled)
 
-    # ========== SIMPLE VLM REASONING ON/OFF TOGGLE ==========
+    # ========== MODULAR VLM REASONING AND PROBE CONFIGURATION ==========
     def enable_vlm_reasoning(self, enabled: bool = True):
         """
-        Simple on/off switch for VLM reasoning (MAIN METHOD TO USE)
+        Enable/disable VLM for reasoning stage (dual-model approach only)
 
         Args:
             enabled: True = use VLM when image available (with LLM fallback)
-                    False = always use LLM only
+                    False = always use LLM only for reasoning
         """
         print_t(f"[C] VLM reasoning: {'ENABLING' if enabled else 'DISABLING'}")
         self.planner.enable_vlm_reasoning(enabled)
 
+    def enable_vlm_probe(self, enabled: bool = True):
+        """
+        Enable/disable VLM for probe functionality (independent of reasoning)
+
+        Args:
+            enabled: True = use VLM for probe when image available (with fallback)
+                    False = always use unfintuned model for probe
+        """
+        print_t(f"[C] VLM probe: {'ENABLING' if enabled else 'DISABLING'}")
+        self.planner.enable_vlm_probe(enabled)
+
     def is_vlm_reasoning_enabled(self) -> bool:
         """Check if VLM reasoning is currently enabled"""
         return self.planner.is_vlm_reasoning_enabled()
+
+    def is_vlm_probe_enabled(self) -> bool:
+        """Check if VLM probe is currently enabled"""
+        return self.planner.is_vlm_probe_enabled()
 
     def toggle_vlm_reasoning(self) -> bool:
         """Toggle VLM reasoning on/off and return new state"""
         new_state = self.planner.toggle_vlm_reasoning()
         print_t(f"[C] VLM reasoning toggled: {'ON' if new_state else 'OFF'}")
         return new_state
+
+    def toggle_vlm_probe(self) -> bool:
+        """Toggle VLM probe on/off and return new state"""
+        new_state = self.planner.toggle_vlm_probe()
+        print_t(f"[C] VLM probe toggled: {'ON' if new_state else 'OFF'}")
+        return new_state
+
+    def disable_vlm_all(self):
+        """Disable VLM for both reasoning and probe"""
+        print_t(f"[C] Disabling VLM for both reasoning and probe")
+        self.planner.disable_vlm_all()
+
+    def enable_vlm_all(self):
+        """Enable VLM for both reasoning and probe"""
+        print_t(f"[C] Enabling VLM for both reasoning and probe")
+        self.planner.enable_vlm_all()
 
     # ========== SIMPLIFIED ENHANCED REPLAN CONTROLLER CONFIGURATION ==========
     def configure_safety_limits(self, max_iterations: int = None, max_time: float = None,
@@ -315,6 +387,124 @@ class LLMController():
             self.auto_corrector.clear_target()
             return "False", True  # Replan due to error
 
+    def skill_yolo_classify(self, description: str) -> Tuple[Optional[str], bool]:
+        """
+        YOLO + LLM classification skill for scan_abstract
+
+        Returns positioned object reference for goto compatibility
+        Example: "food" → "apple[0.7]" → can be used by goto(_1)
+        """
+        print_t(f"[C] === YOLO + LLM CLASSIFICATION ===")
+        print_t(f"[C] Classifying for: {description}")
+
+        # Check for cancellation before executing
+        if self.cancellation_event.is_set():
+            print_t("[C] YOLO classification cancelled")
+            return "False", False
+
+        try:
+            # Get current scene object list from YOLO
+            scene_objects = self.vision.get_obj_list()
+
+            if not scene_objects or scene_objects == "[]":
+                print_t(f"[C] No objects detected for classification")
+                return "False", False
+
+            print_t(f"[C] Available objects: {scene_objects}")
+
+            # Classification prompt - ask LLM to identify which object matches description
+            classification_prompt = f"""/no think You are an object classifier. You will be given an object list of object names and their coordinates, determine if it any match the given criteria. 
+            Objects will appear in 2d, ignore this and determine if what they represent matches the criteria.
+
+Detected Objects: {scene_objects}
+Criteria: {description}
+
+Instructions:
+- Return ONLY the exact object name that best matches
+- If multiple objects match, pick the most relevant one
+- If no objects match, return "False"
+- For status questions such as hot or cold, guess off of object attributes and be categorical in your assumptions. (For example a stove would be hot, a refrigerator would be cold, any animals would be alive, any bowls/chairs/etc. would be stationary)
+- Format you answer in this format: <answer> (False/Object_name) </answer>
+"""
+
+            print_t(f"[C] Sending to classifier model: {self.planner.classifier_model}")
+
+            # Get classification from LLM
+            response = self.planner.classifier_llm.request(
+                classification_prompt,
+                self.planner.classifier_model,
+                stream=False
+            )
+
+            # Clean up response - robust parsing for multiple formats
+            response_clean = response.strip()
+
+            # Extract from answer tags if present
+            if '<answer>' in response_clean and '</answer>' in response_clean:
+                # Extract content between <answer> and </answer>
+                start = response_clean.find('<answer>') + len('<answer>')
+                end = response_clean.find('</answer>')
+                response_clean = response_clean[start:end].strip()
+                print_t(f"[C] Extracted from answer tags: '{response_clean}'")
+
+            # Remove thinking tags if they still exist (fallback)
+            elif '<think>' in response_clean:
+                if '</think>' in response_clean:
+                    response_clean = response_clean.split('</think>')[-1].strip()
+                else:
+                    response_clean = response_clean.split('<think>')[-1].strip()
+                print_t(f"[C] Extracted after think tags: '{response_clean}'")
+
+            # Clean up parentheses and quotes
+            response_clean = response_clean.strip('()').strip('"\'').strip()
+
+            # Robust parsing for different formats
+            if response_clean.lower() == 'false':
+                # Format: (False)
+                classified_object = 'false'
+                print_t(f"[C] No match found (False)")
+            elif response_clean.lower().startswith('true/'):
+                # Format: (True/person_1)
+                classified_object = response_clean[5:].strip().lower()  # Remove "True/" prefix
+                print_t(f"[C] Found match with True/ prefix: '{classified_object}'")
+            elif response_clean.lower() != 'false' and len(response_clean) > 0:
+                # Format: (person_1) - direct object name
+                classified_object = response_clean.lower()
+                print_t(f"[C] Found direct object name: '{classified_object}'")
+            else:
+                # Fallback for empty or malformed responses
+                classified_object = 'false'
+                print_t(f"[C] Fallback to False for malformed response")
+
+            print_t(f"[C] Raw response: '{response}'")
+            print_t(f"[C] Final classified object: '{classified_object}'")
+
+            if classified_object == "false" or not classified_object:
+                print_t(f"[C] No object matches '{description}'")
+                return "False", False
+
+            # Get the position of the classified object using existing vision system
+            print_t(f"[C] Looking up position for: {classified_object}")
+            object_x_result, position_error = self.vision.object_x(classified_object)
+
+            if position_error or isinstance(object_x_result, str):
+                print_t(f"[C] Could not find position for '{classified_object}': {object_x_result}")
+                return "False", False
+
+            # Format as positioned object reference for goto compatibility
+            positioned_object = f"{classified_object}[{object_x_result:.2f}]"
+            print_t(f"[C] YOLO+LLM classification successful: {positioned_object}")
+
+            # Set target for auto-correction system
+            self.auto_corrector.set_target_object(classified_object)
+
+            return positioned_object, False
+
+        except Exception as e:
+            print_t(f"[C] Error in YOLO+LLM classification: {e}")
+            self.auto_corrector.clear_target()
+            return "False", True  # Signal replan needed
+
     def skill_goto(self, object_name: str) -> Tuple[None, bool]:
         print_t(f'[C] Executing goto: {object_name}')
 
@@ -384,6 +574,48 @@ class LLMController():
             time.sleep(0.1)
         return None, False
 
+    def skill_probe(self, question: str) -> Tuple[any, bool]:
+        """Probe skill with modular VLM support - provides current image to planner if VLM probe enabled"""
+        print_t(f"[C] === PROBE SKILL WITH MODULAR VLM SUPPORT ===")
+        print_t(f"[C] Probe question: {question}")
+
+        # Check for cancellation before executing
+        if self.cancellation_event.is_set():
+            print_t("[C] Probe cancelled")
+            return "False", False
+
+        try:
+            # Get current frame path for VLM probe if VLM probe is enabled (separate from reasoning)
+            if self.planner.is_vlm_probe_enabled():
+                current_image_path = self.get_latest_frame_path()
+                if current_image_path:
+                    print_t(f"[C] Providing current image for VLM probe: {current_image_path}")
+                    # Set current image path for planner to use
+                    self.planner._current_image_path = current_image_path
+                else:
+                    print_t(f"[C] Could not get current image, probe will use unfintuned fallback")
+                    self.planner._current_image_path = None
+            else:
+                print_t(f"[C] VLM probe disabled, using unfintuned model")
+                self.planner._current_image_path = None
+
+            # Call planner's probe method
+            result, replan_needed = self.planner.probe(question)
+
+            # Clean up image path
+            if hasattr(self.planner, '_current_image_path'):
+                delattr(self.planner, '_current_image_path')
+
+            print_t(f"[C] Probe result: {result}")
+            return result, replan_needed
+
+        except Exception as e:
+            print_t(f"[C] Error in probe skill: {e}")
+            # Clean up image path on error
+            if hasattr(self.planner, '_current_image_path'):
+                delattr(self.planner, '_current_image_path')
+            return "False", False
+
     # ========== AUTO-CORRECTION INTEGRATION ==========
     def _extract_target_objects_from_plan(self, minispec_code: str) -> Optional[str]:
         """
@@ -402,6 +634,7 @@ class LLMController():
             r"s\('([^']+)'\)",  # scan('object')
             r"g\('([^']+)'\)",  # goto('object')
             r"ye\('([^']+)'\)",  # yoloe_detect('object')
+            r"yc\('([^']+)'\)",  # yolo_classify('object')
         ]
 
         for pattern in patterns:
@@ -609,14 +842,16 @@ class LLMController():
                                           use_vlm: bool = None):
         """
         Execute task description using the simplified enhanced agentic pipeline
-        Now with simple VLM on/off toggle and consistent image provision
+        Now with simple VLM on/off toggle and consistent image provision, PLUS combined model support
 
         INTEGRATION NOTES:
-        - VLM gets fresh current frame on every planning iteration when enabled
+        - Can use either dual-model approach (reasoning + writing) OR single combined model
+        - VLM gets fresh current frame on every planning iteration when enabled (dual-model only)
         - Provided image_path is used only on first iteration (if available)
         - All subsequent iterations use get_latest_frame_path() for current visual context
-        - VLM receives same textual context as regular LLM plus visual information
+        - Combined model approach bypasses VLM reasoning stage entirely
         - Simple toggle: VLM is either ON (with fallback) or OFF (LLM only)
+        - FIXED: Always perform replan assessment after every execution (only once per iteration)
 
         Args:
             task_description: Natural language task description
@@ -627,7 +862,7 @@ class LLMController():
             self.append_message("[Warning] Controller is waiting for takeoff...")
             return
 
-        # Determine VLM usage - SIMPLE LOGIC
+        # Determine VLM usage - SIMPLE LOGIC (only applies to dual-model mode)
         if use_vlm is not None:
             vlm_enabled_for_task = use_vlm
             print_t(f"[C] VLM usage overridden: {'ON' if use_vlm else 'OFF'}")
@@ -635,10 +870,16 @@ class LLMController():
             vlm_enabled_for_task = self.is_vlm_reasoning_enabled()
             print_t(f"[C] VLM usage (global setting): {'ON' if vlm_enabled_for_task else 'OFF'}")
 
-        print_t("[C] ========== SIMPLIFIED ENHANCED AGENTIC TASK EXECUTION START ==========")
+        # Check if we're using combined model mode
+        combined_mode = self.is_combined_mode_enabled()
+        planning_approach = "COMBINED MODEL" if combined_mode else "DUAL-MODEL"
+
+        print_t("[C] ========== ENHANCED AGENTIC TASK EXECUTION START ==========")
         print_t(f"[C] Task: {task_description}")
         print_t(f"[C] Image provided: {image_path if image_path else 'None'}")
-        print_t(f"[C] VLM will be used: {vlm_enabled_for_task}")
+        print_t(f"[C] Planning approach: {planning_approach}")
+        if not combined_mode:
+            print_t(f"[C] VLM will be used: {vlm_enabled_for_task}")
         print_t(f"[C] Manual stop available at any time")
 
         self.append_message('[TASK]: ' + task_description)
@@ -655,8 +896,8 @@ class LLMController():
         original_vlm_enabled = self.planner.vlm_enabled
         original_use_vlm_for_reasoning = self.planner.use_vlm_for_reasoning
 
-        if use_vlm is not None:
-            # Override both flags for this task
+        if use_vlm is not None and not combined_mode:
+            # Override both flags for this task (only if not using combined mode)
             self.planner.vlm_enabled = use_vlm
             self.planner.use_vlm_for_reasoning = use_vlm
             print_t(f"[C] VLM state overridden for this task: {use_vlm}")
@@ -677,13 +918,13 @@ class LLMController():
                 print_t(f"[C] ===== PLANNING ITERATION {planning_iteration} =====")
 
                 try:
-                    # Get dual-stage planner response with optional VLM
-                    print_t("[C] Calling dual-stage planner...")
+                    # Get dual-stage planner response with optional VLM OR combined model
+                    print_t(f"[C] Calling {planning_approach} planner...")
                     execution_start_time = time.time()
 
-                    # Get current frame path for VLM if VLM is enabled
+                    # Get current frame path for VLM if VLM is enabled AND we're using dual-model
                     current_image_path = None
-                    if vlm_enabled_for_task:
+                    if vlm_enabled_for_task and not combined_mode:
                         if planning_iteration == 1 and image_path:
                             # Use provided image on first iteration if available
                             current_image_path = image_path
@@ -695,10 +936,12 @@ class LLMController():
                                 print_t(f"[C] Using current frame for VLM: {current_image_path}")
                             else:
                                 print_t(f"[C] Warning: Could not get current frame for VLM")
+                    elif combined_mode:
+                        print_t(f"[C] Combined model mode - no VLM reasoning")
                     else:
                         print_t(f"[C] VLM disabled - using LLM only")
 
-                    # Call planner (VLM will be used if enabled and image available)
+                    # Call planner (automatically routes to combined or dual-model approach)
                     plan_reason, minispec_code = self.planner.plan(
                         task_description,
                         execution_history=self.execution_history,
@@ -726,7 +969,8 @@ class LLMController():
                     print_t(f"[C] Reasoning: {plan_reason}")
                     print_t(f"[C] Generated code: {minispec_code}")
                     print_t(f"[C] Code length: {len(minispec_code)} characters")
-                    if current_image_path:
+                    print_t(f"[C] Planning mode: {planning_approach}")
+                    if current_image_path and not combined_mode:
                         print_t(f"[C] VLM used image: {current_image_path}")
 
                     # Send messages to UI/queue - Only send once here
@@ -788,76 +1032,104 @@ class LLMController():
                     print_t("[C] Task cancelled after execution")
                     break
 
-                # SIMPLIFIED: Enhanced replanning with only COMPLETE/CONTINUE decisions
-                # Always assess the pipeline state, even if no explicit replan requested
-                should_assess = True
-                if ret_val and hasattr(ret_val, 'replan'):
-                    should_assess = ret_val.replan
+                # FIXED: Always perform replan assessment after every execution (only once per iteration)
+                print_t(f"[C] ===== AUTOMATIC REPLAN ASSESSMENT STAGE =====")
+                print_t(f"[C] Assessment triggered automatically after execution")
 
-                if should_assess or (ret_val and hasattr(ret_val, 'replan') and ret_val.replan):
-                    print_t(f"[C] ===== SIMPLIFIED REPLAN ASSESSMENT STAGE =====")
+                # Create comprehensive pipeline state
+                pipeline_state = self._create_pipeline_state(
+                    planning_iteration=planning_iteration,
+                    original_task=original_task,
+                    plan_reason=plan_reason,
+                    minispec_code=minispec_code,
+                    planning_time=planning_time,
+                    execution_result=ret_val,
+                    execution_time=execution_time,
+                    execution_success=execution_success,
+                    corrections_applied=corrections_applied
+                )
 
-                    # Create comprehensive pipeline state
-                    pipeline_state = self._create_pipeline_state(
-                        planning_iteration=planning_iteration,
-                        original_task=original_task,
-                        plan_reason=plan_reason,
-                        minispec_code=minispec_code,
-                        planning_time=planning_time,
-                        execution_result=ret_val,
-                        execution_time=execution_time,
-                        execution_success=execution_success,
-                        corrections_applied=corrections_applied
-                    )
+                # Get simplified replan assessment (only COMPLETE or CONTINUE)
+                try:
+                    replan_response = self.replan_controller.assess_pipeline_state(pipeline_state)
 
-                    # Get simplified replan assessment (only COMPLETE or CONTINUE)
-                    try:
-                        replan_response = self.replan_controller.assess_pipeline_state(pipeline_state)
+                    print_t(f"[C] Simplified Replan Assessment:")
+                    print_t(f"[C] - Decision: {replan_response.decision.value}")
+                    print_t(f"[C] - Confidence: {replan_response.confidence:.2f}")
+                    print_t(f"[C] - Progress: {replan_response.progress_estimate}%")
+                    print_t(f"[C] - Reasoning: {replan_response.reasoning}")
 
-                        print_t(f"[C] Simplified Replan Assessment:")
-                        print_t(f"[C] - Decision: {replan_response.decision.value}")
-                        print_t(f"[C] - Confidence: {replan_response.confidence:.2f}")
-                        print_t(f"[C] - Progress: {replan_response.progress_estimate}%")
-                        print_t(f"[C] - Reasoning: {replan_response.reasoning}")
+                    # Display assessment results
+                    self.append_message(f"[AUTO-ASSESS] {replan_response.decision.value} - "
+                                        f"Progress: {replan_response.progress_estimate}% - "
+                                        f"Confidence: {replan_response.confidence:.2f}")
+                    self.append_message(f"[REASONING] {replan_response.reasoning}")
 
-                        # Display assessment results
-                        self.append_message(f"[SIMPLIFIED-ASSESS] {replan_response.decision.value} - "
-                                            f"Progress: {replan_response.progress_estimate}% - "
-                                            f"Confidence: {replan_response.confidence:.2f}")
-                        self.append_message(f"[REASONING] {replan_response.reasoning}")
+                    if replan_response.safety_notes:
+                        self.append_message(f"[SAFETY] {replan_response.safety_notes}")
 
-                        if replan_response.safety_notes:
-                            self.append_message(f"[SAFETY] {replan_response.safety_notes}")
+                    # Handle simplified decision types
+                    if replan_response.decision == ReplanDecision.COMPLETE:
+                        print_t("[C] ===== TASK MARKED COMPLETE BY SIMPLIFIED CONTROLLER =====")
+                        self.append_message("[COMPLETE] Task completed by simplified replan controller")
+                        break
 
-                        # Handle simplified decision types
-                        if replan_response.decision == ReplanDecision.COMPLETE:
-                            print_t("[C] ===== TASK MARKED COMPLETE BY SIMPLIFIED CONTROLLER =====")
-                            self.append_message("[COMPLETE] Task completed by simplified replan controller")
-                            break
+                    elif replan_response.decision == ReplanDecision.REPLAN_CONTINUE:
+                        # Check if we should use the planner's replan assessment for natural language restart
+                        print_t("[C] ===== CHECKING FOR NATURAL LANGUAGE REPLAN =====")
 
-                        elif replan_response.decision == ReplanDecision.REPLAN_CONTINUE:
-                            print_t("[C] ===== CONTINUING WITH CURRENT APPROACH =====")
+                        try:
+                            # Use planner's assess_replan to get natural language task
+                            decision, progress, feedback, new_task = self.planner.assess_replan(
+                                original_task=original_task,
+                                past_reasoning=plan_reason,
+                                executed_commands=str(self.execution_history) if self.execution_history else "None",
+                                current_scene=self.vision.get_obj_list()
+                            )
+
+                            if decision == "REPLAN" and new_task and new_task.strip():
+                                print_t("[C] ===== RESTARTING WITH NEW NATURAL LANGUAGE TASK =====")
+                                print_t(f"[C] Original task: {original_task}")
+                                print_t(f"[C] New task from replan model: {new_task}")
+
+                                # Update task description and restart planning loop
+                                task_description = new_task
+                                self.append_message(f"[RESTART] Replan model generated new task: {new_task}")
+
+                                # Clear execution history for fresh start
+                                self.execution_history = None
+                                continue
+
+                            else:
+                                print_t("[C] ===== CONTINUING WITH CURRENT APPROACH =====")
+                                if replan_response.next_guidance:
+                                    print_t(f"[C] Guidance: {replan_response.next_guidance}")
+                                    self.append_message(f"[CONTINUE] {replan_response.next_guidance}")
+                                else:
+                                    self.append_message(f"[CONTINUE] {replan_response.reasoning}")
+                                continue
+
+                        except Exception as replan_error:
+                            print_t(f"[C] Error in natural language replan: {replan_error}")
+                            # Fall back to continuing
+                            print_t("[C] ===== FALLBACK: CONTINUING WITH CURRENT APPROACH =====")
                             if replan_response.next_guidance:
-                                print_t(f"[C] Guidance: {replan_response.next_guidance}")
                                 self.append_message(f"[CONTINUE] {replan_response.next_guidance}")
                             else:
                                 self.append_message(f"[CONTINUE] {replan_response.reasoning}")
                             continue
 
-                    except Exception as e:
-                        print_t(f"[C] ERROR during simplified replan assessment: {e}")
-                        self.append_message(f"[ERROR] Simplified replan assessment failed: {e}")
-                        # Fall back to completion for safety
-                        print_t(f"[C] ===== SAFETY FALLBACK TO COMPLETION =====")
-                        self.append_message("[SAFETY] Marking task complete due to assessment error")
-                        break
-                else:
-                    print_t("[C] ===== TASK COMPLETED =====")
+                except Exception as e:
+                    print_t(f"[C] ERROR during simplified replan assessment: {e}")
+                    self.append_message(f"[ERROR] Simplified replan assessment failed: {e}")
+                    # Fall back to completion for safety
+                    print_t(f"[C] ===== SAFETY FALLBACK TO COMPLETION =====")
+                    self.append_message("[SAFETY] Marking task complete due to assessment error")
                     break
 
         finally:
             # INTEGRATION FIX: Restore both VLM flags if they were overridden
-            if use_vlm is not None:
+            if use_vlm is not None and not combined_mode:
                 self.planner.vlm_enabled = original_vlm_enabled
                 self.planner.use_vlm_for_reasoning = original_use_vlm_for_reasoning
                 print_t(
@@ -871,12 +1143,14 @@ class LLMController():
         total_time = time.time() - self.task_start_time if self.task_start_time else 0
 
         if self.controller_active:
-            print_t(f"[C] ========== SIMPLIFIED ENHANCED TASK EXECUTION COMPLETE ==========")
+            print_t(f"[C] ========== ENHANCED TASK EXECUTION COMPLETE ==========")
+            print_t(f"[C] Planning approach used: {planning_approach}")
             print_t(f"[C] Total planning iterations: {total_iterations}")
             print_t(f"[C] Total execution time: {total_time:.1f}s")
-            self.append_message(f'\n[Task ended - {total_iterations} iterations, {total_time:.1f}s]')
+            self.append_message(
+                f'\n[Task ended - {planning_approach} - {total_iterations} iterations, {total_time:.1f}s]')
         else:
-            print_t(f"[C] ========== SIMPLIFIED ENHANCED TASK EXECUTION CANCELLED ==========")
+            print_t(f"[C] ========== ENHANCED TASK EXECUTION CANCELLED ==========")
             print_t(f"[C] Completed iterations before cancellation: {total_iterations}")
             self.append_message(f'\n[Task cancelled - {total_iterations} iterations]')
 
@@ -901,7 +1175,7 @@ class LLMController():
     def execute_task_with_image(self, task_description: str, image_path: str):
         """
         Convenience method for executing tasks with image input
-        Automatically enables VLM for this execution
+        Automatically enables VLM for this execution (only if using dual-model approach)
 
         INTEGRATION NOTE: This is a clean way to use VLM with a specific image
         """
