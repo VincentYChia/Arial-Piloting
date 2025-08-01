@@ -40,11 +40,28 @@ Natural Language Input → YoloV11 Vision → Qwen 3-4B Reasoning → Qwen 3-1.7
 ## 📋 Requirements
 
 - **Hardware**: 8GB VRAM recommeneded 
-- - **[Ollama](https://ollama.ai)**: For local model serving
+- **[Ollama](https://ollama.ai)**: For local model serving
 - **[YoloV11](https://github.com/ultralytics/ultralytics)**: Object detection
 - **[YoloE](https://github.com/kadirnar/yolo-e)**: Enhanced scene analysis
 
 Fine-tuned models and training data available in `/models` directory.
+
+## 🤖 Model Configuration
+
+All models use Q4_K_M quantization with identical inference parameters:
+
+| Model | Purpose | Base Model | Quantization |
+|-------|---------|------------|--------------|
+| **Writing Model** | MiniSpec code generation | Qwen3-1.7B | Q4_K_M |
+| **Reasoning Model** | Flight plan reasoning | Qwen3-4B | Q4_K_M |
+| **Abstract Classifier** | Scene categorization | Qwen3-0.6B | Q4_K_M |
+| **Replanning Model** | Task assessment | Qwen3-1.7B | Q4_K_M |
+| **VLM** | Environment probing | Qwen2.5VL | Q4_K_M |
+
+### Inference Parameters
+- **top_k**: 20
+- **top_p**: 0.95
+- **repeat_penalty**: 1
 
 ## 📝 Citation
 
