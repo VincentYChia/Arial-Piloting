@@ -76,3 +76,5 @@ All models use Q4_K_M quantization with identical inference parameters:
 ```
 
 **Note**: Research software. Follow local drone regulations and safety guidelines.
+
+- Research Blog: https://sites.google.com/view/arial-piloting/home
