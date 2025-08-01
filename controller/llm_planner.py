@@ -169,8 +169,8 @@ class LLMPlanner():
         self.classifier_model = "qwen3:0.6b"
 
         # Temperature settings for each model
-        self.reasoning_temperature = 0.25  # Slightly higher for reasoning creativity
-        self.minispec_temperature = 0.05  # Very low for precise code generation
+        self.reasoning_temperature = 0.4  # Slightly higher for reasoning creativity
+        self.minispec_temperature = 0.1  # Very low for precise code generation
         self.vlm_temperature = 0.3  # NEW: VLM temperature
         self.replan_temperature = 0.3  # NEW: Replan temperature
         self.combined_temperature = 0.1  # NEW: Combined model temperature

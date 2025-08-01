@@ -686,179 +686,197 @@ class Statement:
         return s
 
 
-_queue = Queue()
-self.message_queue = message_queue
+class MiniSpecInterpreter:
+    def __init__(self, message_queue: queue.Queue):
+        self.env = {}
+        self.ret = False
+        self.code_buffer: str = ''
+        self.execution_history = []
+        if Statement.low_level_skillset is None or \
+                Statement.high_level_skillset is None:
+            raise Exception('Statement: Skillset is not initialized')
 
+        self.cancellation_event = Event()
+        Statement.cancellation_event = self.cancellation_event
 
-def cancel(self):
-    """Cancel the current execution"""
-    print_debug("[CANCEL] Setting cancellation event")
-    self.cancellation_event.set()
+        Statement.execution_queue = Queue()
+        self.execution_thread = Thread(target=self.executor)
+        self.execution_thread.daemon = True
+        self.execution_thread.start()
 
-    while not Statement.execution_queue.empty():
-        try:
-            Statement.execution_queue.get_nowait()
-        except queue.Empty:
-            break
+        self.timestamp_get_plan = None
+        self.timestamp_start_execution = None
+        self.timestamp_end_execution = None
+        self.program_count = 0
+        self.ret_queue = Queue()
+        self.message_queue = message_queue
 
-    self.ret_queue.put(MiniSpecReturnValue("Task cancelled", False))
+    def cancel(self):
+        """Cancel the current execution"""
+        print_debug("[CANCEL] Setting cancellation event")
+        self.cancellation_event.set()
 
-
-def _fix_scan_goto_patterns(self, code_text: str) -> str:
-    """
-    Simple pattern fixer for common scan+goto anti-patterns
-    Fixes: ?sa('obj'){g('obj')} → _tmp=sa('obj');?_tmp!=False{g(_tmp)}
-    """
-    import re
-
-    # Pattern: ?function('param'){g('param')} or ?function('param'){goto('param')}
-    scan_functions = ['sa', 'yc', 'ye', 's']  # scan_abstract, yolo_classify, yoloe, scan
-    goto_functions = ['g', 'goto']
-
-    original_code = code_text
-    fixes_applied = []
-
-    for scan_func in scan_functions:
-        for goto_func in goto_functions:
-            # Pattern: ?scan_func('param'){goto_func('param')}
-            pattern = rf'\?{scan_func}\(([\'"])([^\'\"]+)\1\)\s*\{{\s*{goto_func}\(\1\2\1\)\s*\}}'
-
-            def replace_pattern(match):
-                quote_char = match.group(1)  # ' or "
-                param = match.group(2)  # the parameter
-
-                # Generate unique temp variable name
-                temp_var = f'_tmp{len(fixes_applied)}'
-
-                # Create fixed pattern: _tmp=sa('param');?_tmp!=False{g(_tmp)}
-                fixed = f'{temp_var}={scan_func}({quote_char}{param}{quote_char});?{temp_var}!=False{{{goto_func}({temp_var})}}'
-
-                fixes_applied.append(f"{scan_func}('{param}')→{goto_func}() pattern")
-                return fixed
-
-            code_text = re.sub(pattern, replace_pattern, code_text)
-
-    if fixes_applied:
-        print_debug(f"[PATTERN FIX] Applied {len(fixes_applied)} scan+goto pattern fixes:")
-        for fix in fixes_applied:
-            print_debug(f"  - Fixed: {fix}")
-        print_debug(f"[PATTERN FIX] Before: {original_code}")
-        print_debug(f"[PATTERN FIX] After:  {code_text}")
-
-    return code_text
-
-
-def execute(self, code: Stream[ChatCompletion.ChatCompletionChunk] | List[str]) -> MiniSpecReturnValue:
-    print_t(f'>>> Get a stream')
-
-    self.cancellation_event.clear()
-
-    # Convert stream/list to string for pattern fixing
-    if isinstance(code, list):
-        code_text = ''.join(code)
-    else:
-        # For streams, we need to collect all chunks first
-        code_chunks = []
-        for chunk in code:
-            if isinstance(chunk, str):
-                code_chunks.append(chunk)
-            else:
-                content = chunk.choices[0].delta.content
-                if content:
-                    code_chunks.append(content)
-        code_text = ''.join(code_chunks)
-
-    # Apply pattern fixes
-    fixed_code_text = self._fix_scan_goto_patterns(code_text)
-
-    # Convert back to list format for parsing
-    fixed_code = [fixed_code_text]
-
-    self.execution_history = []
-    self.timestamp_get_plan = time.time()
-    program = MiniSpecProgram(mq=self.message_queue, cancellation_event=self.cancellation_event)
-    program.parse(fixed_code, True)
-    self.program_count = len(program.statements)
-    t2 = time.time()
-    print_t(">>> Program: ", program, "Time: ", t2 - self.timestamp_get_plan)
-
-
-def executor(self):
-    while True:
-        if not Statement.execution_queue.empty():
-            if self.timestamp_start_execution is None:
-                self.timestamp_start_execution = time.time()
-                print_t(">>> Start execution")
-
+        while not Statement.execution_queue.empty():
             try:
-                statement = Statement.execution_queue.get(timeout=0.1)
+                Statement.execution_queue.get_nowait()
             except queue.Empty:
-                continue
+                break
 
-            print_debug(f'Queue get statement: {statement}')
+        self.ret_queue.put(MiniSpecReturnValue("Task cancelled", False))
 
-            if self.cancellation_event.is_set():
-                self.ret_queue.put(MiniSpecReturnValue("Task cancelled", False))
-                return
+    def _fix_scan_goto_patterns(self, code_text: str) -> str:
+        """
+        Simple pattern fixer for common scan+goto anti-patterns
+        Fixes: ?sa('obj'){g('obj')} → _tmp=sa('obj');?_tmp!=False{g(_tmp)}
+        """
+        import re
 
-            try:
-                ret_val = statement.eval()
-                print_t(f'Queue statement done: {statement}')
+        # Pattern: ?function('param'){g('param')} or ?function('param'){goto('param')}
+        scan_functions = ['sa', 'yc', 'ye', 's']  # scan_abstract, yolo_classify, yoloe, scan
+        goto_functions = ['g', 'goto']
 
-                # Check if this was an error and we're at the last statement
-                is_error = isinstance(ret_val.value, str) and ret_val.value.startswith("Error:")
-                is_last_statement = self.program_count == 1
+        original_code = code_text
+        fixes_applied = []
 
-                if is_error and is_last_statement:
-                    print_debug(f'Last statement failed with error: {ret_val.value}, triggering replan')
-                    # Clear remaining queue and trigger replan
-                    while not Statement.execution_queue.empty():
-                        try:
-                            Statement.execution_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    self.ret_queue.put(MiniSpecReturnValue(ret_val.value, True))  # Trigger replan
+        for scan_func in scan_functions:
+            for goto_func in goto_functions:
+                # Pattern: ?scan_func('param'){goto_func('param')}
+                pattern = rf'\?{scan_func}\(([\'"])([^\'\"]+)\1\)\s*\{{\s*{goto_func}\(\1\2\1\)\s*\}}'
+
+                def replace_pattern(match):
+                    quote_char = match.group(1)  # ' or "
+                    param = match.group(2)  # the parameter
+
+                    # Generate unique temp variable name
+                    temp_var = f'_tmp{len(fixes_applied)}'
+
+                    # Create fixed pattern: _tmp=sa('param');?_tmp!=False{g(_tmp)}
+                    fixed = f'{temp_var}={scan_func}({quote_char}{param}{quote_char});?{temp_var}!=False{{{goto_func}({temp_var})}}'
+
+                    fixes_applied.append(f"{scan_func}('{param}')→{goto_func}() pattern")
+                    return fixed
+
+                code_text = re.sub(pattern, replace_pattern, code_text)
+
+        if fixes_applied:
+            print_debug(f"[PATTERN FIX] Applied {len(fixes_applied)} scan+goto pattern fixes:")
+            for fix in fixes_applied:
+                print_debug(f"  - Fixed: {fix}")
+            print_debug(f"[PATTERN FIX] Before: {original_code}")
+            print_debug(f"[PATTERN FIX] After:  {code_text}")
+
+        return code_text
+
+    def execute(self, code: Stream[ChatCompletion.ChatCompletionChunk] | List[str]) -> MiniSpecReturnValue:
+        print_t(f'>>> Get a stream')
+
+        self.cancellation_event.clear()
+
+        # Convert stream/list to string for pattern fixing
+        if isinstance(code, list):
+            code_text = ''.join(code)
+        else:
+            # For streams, we need to collect all chunks first
+            code_chunks = []
+            for chunk in code:
+                if isinstance(chunk, str):
+                    code_chunks.append(chunk)
+                else:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        code_chunks.append(content)
+            code_text = ''.join(code_chunks)
+
+        # Apply pattern fixes
+        fixed_code_text = self._fix_scan_goto_patterns(code_text)
+
+        # Convert back to list format for parsing
+        fixed_code = [fixed_code_text]
+
+        self.execution_history = []
+        self.timestamp_get_plan = time.time()
+        program = MiniSpecProgram(mq=self.message_queue, cancellation_event=self.cancellation_event)
+        program.parse(fixed_code, True)
+        self.program_count = len(program.statements)
+        t2 = time.time()
+        print_t(">>> Program: ", program, "Time: ", t2 - self.timestamp_get_plan)
+
+    def executor(self):
+        while True:
+            if not Statement.execution_queue.empty():
+                if self.timestamp_start_execution is None:
+                    self.timestamp_start_execution = time.time()
+                    print_t(">>> Start execution")
+
+                try:
+                    statement = Statement.execution_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                print_debug(f'Queue get statement: {statement}')
+
+                if self.cancellation_event.is_set():
+                    self.ret_queue.put(MiniSpecReturnValue("Task cancelled", False))
                     return
-                elif is_error:
-                    print_debug(f'Statement failed with error: {ret_val.value}, continuing...')
-                    # Continue with execution for non-last statements
-                elif statement.ret:
-                    while not Statement.execution_queue.empty():
-                        try:
-                            Statement.execution_queue.get_nowait()
-                        except queue.Empty:
-                            break
+
+                try:
+                    ret_val = statement.eval()
+                    print_t(f'Queue statement done: {statement}')
+
+                    # Check if this was an error and we're at the last statement
+                    is_error = isinstance(ret_val.value, str) and ret_val.value.startswith("Error:")
+                    is_last_statement = self.program_count == 1
+
+                    if is_error and is_last_statement:
+                        print_debug(f'Last statement failed with error: {ret_val.value}, triggering replan')
+                        # Clear remaining queue and trigger replan
+                        while not Statement.execution_queue.empty():
+                            try:
+                                Statement.execution_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        self.ret_queue.put(MiniSpecReturnValue(ret_val.value, True))  # Trigger replan
+                        return
+                    elif is_error:
+                        print_debug(f'Statement failed with error: {ret_val.value}, continuing...')
+                        # Continue with execution for non-last statements
+                    elif statement.ret:
+                        while not Statement.execution_queue.empty():
+                            try:
+                                Statement.execution_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        self.ret_queue.put(ret_val)
+                        return
+
+                except Exception as e:
+                    # This is a last-resort catch for any unhandled exceptions
+                    error_msg = f"Unhandled error in statement execution: {str(e)}"
+                    print_debug(error_msg)
+                    ret_val = MiniSpecReturnValue.error(error_msg)
+
+                    # If this is the last statement, trigger replan
+                    if self.program_count == 1:
+                        print_debug(f'Last statement crashed with unhandled error, triggering replan')
+                        while not Statement.execution_queue.empty():
+                            try:
+                                Statement.execution_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        self.ret_queue.put(MiniSpecReturnValue(error_msg, True))  # Trigger replan
+                        return
+
+                self.execution_history.append(statement)
+                self.program_count -= 1
+
+                if self.program_count == 0:
+                    self.timestamp_end_execution = time.time()
+                    print_t(f'>>> Execution time: {self.timestamp_end_execution - self.timestamp_start_execution}')
+                    self.timestamp_start_execution = None
                     self.ret_queue.put(ret_val)
                     return
+            else:
+                time.sleep(0.005)
 
-            except Exception as e:
-                # This is a last-resort catch for any unhandled exceptions
-                error_msg = f"Unhandled error in statement execution: {str(e)}"
-                print_debug(error_msg)
-                ret_val = MiniSpecReturnValue.error(error_msg)
-
-                # If this is the last statement, trigger replan
-                if self.program_count == 1:
-                    print_debug(f'Last statement crashed with unhandled error, triggering replan')
-                    while not Statement.execution_queue.empty():
-                        try:
-                            Statement.execution_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    self.ret_queue.put(MiniSpecReturnValue(error_msg, True))  # Trigger replan
+                if self.cancellation_event.is_set():
                     return
-
-            self.execution_history.append(statement)
-            self.program_count -= 1
-
-            if self.program_count == 0:
-                self.timestamp_end_execution = time.time()
-                print_t(f'>>> Execution time: {self.timestamp_end_execution - self.timestamp_start_execution}')
-                self.timestamp_start_execution = None
-                self.ret_queue.put(ret_val)
-                return
-        else:
-            time.sleep(0.005)
-
-            if self.cancellation_event.is_set():
-                return

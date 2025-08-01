@@ -890,7 +890,7 @@ Instructions:
         self.task_start_time = time.time()
         self.initial_scene = self.vision.get_obj_list()
         self.pipeline_iterations = []
-        self.replan_controller.start_new_task(task_description)
+        self.replan_controller = SimplifiedEnhancedReplanController(self.planner.replan_llm)
 
         # Save current VLM state and set for this task - FIXED: Save both flags
         original_vlm_enabled = self.planner.vlm_enabled
