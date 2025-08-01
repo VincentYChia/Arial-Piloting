@@ -14,10 +14,10 @@ Built upon the [TypeFly](https://github.com/anyscale/typefly) architecture and t
 
 ## 🎥 Demonstrations
 
-Demo 1: https://youtu.be/tjkAhXaK8CI
-Demo 2: https://youtu.be/Vsehu-O4UBI
-Demo 3: https://youtu.be/NxF4KRd12Wg
-Demo 4: https://youtu.be/Nrf4vzC4H_w
+-Demo 1 (Outdoor Following): https://youtu.be/tjkAhXaK8CI
+-Demo 2 (Replan and Task Assessment): https://youtu.be/Vsehu-O4UBI
+-Demo 3 (Chaotic Room w/ Complex Task): https://youtu.be/NxF4KRd12Wg
+-Demo 4 (Conditional Statement): https://youtu.be/Nrf4vzC4H_w
 
 ## 🏗️ Architecture
 
