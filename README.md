@@ -21,7 +21,7 @@ Built upon the [TypeFly](https://github.com/anyscale/typefly) architecture and t
 ## 🏗️ Architecture
 
 ```
-Natural Language Input → YoloV11 Vision → Qwen 3-4B Reasoning → Qwen 3-1.7B Code Generation → MiniSpec Execution
+Natural Language Input → YoloV11 Vision → Qwen 3-4B Reasoning → Qwen 3-1.7B Code Generation → MiniSpec Execution → Replanning and Task Assesment 
                                      ↓
                                Auxiliary Systems:
                                • VLM Environment Probe  
