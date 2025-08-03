@@ -64,17 +64,6 @@ All models use Q4_K_M quantization with identical inference parameters:
 - **top_p**: 0.95
 - **repeat_penalty**: 1
 
-## 📝 Citation
-
-```bibtex
-@misc{arial-piloting,
-  title={Arial-Piloting: Edge-Native LLM Drone Piloting with Autonomous Reasoning},
-  author={Vincent Y. Chia},
-  year={2024},
-  url={https://github.com/VincentYChia/Arial-Piloting}
-}
-```
-
 **Note**: Research software. Follow local drone regulations and safety guidelines.
 
 - Research Blog: https://sites.google.com/view/arial-piloting/home
